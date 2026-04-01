@@ -1,0 +1,4 @@
+node_modules/
+dist/
+backend/osint_web_app.exe
+*.log

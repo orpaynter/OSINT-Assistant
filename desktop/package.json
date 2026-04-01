@@ -1,0 +1,46 @@
+{
+  "name": "osint-assistant-desktop",
+  "version": "0.1.0",
+  "description": "Electron shell that launches the OSINT Assistant Flask backend and wraps it in a desktop window.",
+  "main": "main.js",
+  "license": "MIT",
+  "scripts": {
+    "start": "cross-env NODE_ENV=development electron .",
+    "pack": "electron-builder -w"
+  },
+  "dependencies": {
+    "electron-log": "^5.1.1",
+    "tree-kill": "^1.2.2"
+  },
+  "devDependencies": {
+    "cross-env": "^7.0.3",
+    "electron": "^28.2.0",
+    "electron-builder": "^24.6.4"
+  },
+  "build": {
+    "appId": "com.osintassistant.desktop",
+    "productName": "OSINT Assistant",
+    "directories": {
+      "output": "dist"
+    },
+    "files": [
+      "**/*"
+    ],
+    "extraResources": [
+      {
+        "from": "backend/",
+        "to": "backend",
+        "filter": [
+          "osint_web_app.exe",
+          ".env"
+        ]
+      }
+    ],
+    "win": {
+      "icon": "icon.ico",
+      "target": [
+        "nsis"
+      ]
+    }
+  }
+}
