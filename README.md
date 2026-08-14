@@ -1,270 +1,164 @@
 # OSINT Assistant
 
-An AI-enhanced OSINT (Open Source Intelligence) tool for gathering, analyzing, and reporting on information from various web sources. This tool leverages the power of Perplexity AI to provide deeper insights and more accurate analysis.
+Local-first OSINT assistant for public-source research. This version uses a **local LLM**, connects to the **internet**, supports **Tor/.onion dark-web source access**, and can send governed verification/signal receipts to **local AIA**.
 
-This project includes both a command-line interface and a full-featured web application for easier interaction.
+## Local architecture
 
-## Features
+```text
+OSINT Assistant
+  -> clearnet fetch / optional local SearXNG search
+  -> Tor SOCKS proxy for .onion URLs
+  -> local OpenAI-compatible LLM endpoint
+  -> local AIA /verify and /signals/ingest
+  -> JSON report with source fetches + provider status + AIA receipt
+```
 
-- 🔍 **Web Search:** Collect information from multiple sources based on specific queries
-- 🧠 **AI-Powered Analysis:** Use Perplexity AI for enhanced content analysis
-- 📊 **Entity Recognition:** Identify key people, organizations, and concepts from collected data
-- 🔗 **Connection Analysis:** Map relationships between identified entities
-- 📈 **Pattern Recognition:** Identify trends and patterns in the collected data
-- 📝 **Comprehensive Reporting:** Generate structured reports with visualizations and actionable insights
-- 📤 **Data Export:** Save results in JSON format with proper serialization using Pydantic
+Defaults:
+
+```env
+LOCAL_BASE_URL=http://localhost:11434/v1
+LOCAL_MODEL=llama3.1
+SEARXNG_URL=http://localhost:8080
+TOR_PROXY=socks5h://127.0.0.1:9050
+AIA_BASE_URL=http://localhost:3001
+```
+
+## Evidence and safety rule
+
+Local model output is **analysis**, not proof. Internet or .onion access is for authorized public-source research only. Do not use this tool to buy, sell, access stolen data, bypass authentication, exploit systems, or facilitate illegal activity. AIA capture makes runs governable; it does not make unverified sources true.
 
 ## Installation
 
-### Prerequisites
-
-- Python 3.8+
-- pip package manager
-- Node.js 14+ and npm (for web application)
-
-### Setup
-
-1. Clone the repository:
-   ```bash
-   git clone https://github.com/AXRoux/OSINT-Assistant.git
-   cd OSINT-Assistant
-   ```
-
-2. Install dependencies:
-   ```bash
-   pip install -r requirements.txt
-   ```
-
-3. Set up your environment variables:
-   ```bash
-   cp .env.example .env
-   ```
-   
-4. Edit the `.env` file and add your Perplexity API key:
-   ```
-   PERPLEXITY_API_KEY=your_api_key_here
-   ```
-
-## Usage
-
-### Command Line Interface
-
-Run a search query:
 ```bash
-python osint_assistant.py --query "quantum computing advances"
+git clone https://github.com/orpaynter/OSINT-Assistant.git
+cd OSINT-Assistant
+pip install -r requirements.txt
+cp .env.example .env
 ```
 
-### Web Application
+Start local model server first. Example with Ollama:
 
-Start the web application:
+```bash
+ollama serve
+ollama pull llama3.1
+```
 
-#### Linux/Mac
+Start local AIA separately:
+
+```bash
+cd /path/to/AIA
+uvicorn agsi.api.main:app --port 3001
+```
+
+Optional: start local SearXNG for clearnet search:
+
+```bash
+docker run --rm -p 8080:8080 searxng/searxng
+```
+
+Optional: start Tor for .onion access:
+
+```bash
+# Linux/macOS example
+ tor
+# Windows: run Tor Browser or Tor Expert Bundle and expose SOCKS on 127.0.0.1:9050
+```
+
+## CLI usage
+
+List providers. It should only return `local`:
+
+```bash
+python osint_assistant.py --list-providers
+```
+
+Run local OSINT against a topic:
+
+```bash
+python osint_assistant.py --query "roofing claims AI governance" --results 10
+```
+
+Fetch/analyze a direct internet URL:
+
+```bash
+python osint_assistant.py --query "https://example.com/report" --json
+```
+
+Fetch/analyze a direct .onion URL through Tor:
+
+```bash
+python osint_assistant.py --query "http://exampleonionaddress.onion/path" --json
+```
+
+Override local endpoints:
+
+```bash
+python osint_assistant.py \
+  --query "roofing claims AI governance" \
+  --model llama3.1 \
+  --llm-base-url http://localhost:11434/v1 \
+  --aia-base-url http://localhost:3001 \
+  --json
+```
+
+Disable AIA for a run:
+
+```bash
+python osint_assistant.py --query "example" --skip-aia
+```
+
+## Web application
+
+Start the local web app:
+
 ```bash
 bash run.sh
-```
-or make it executable first:
-```bash
-chmod +x run.sh
-./run.sh
-```
-
-#### Windows
-```
+# or on Windows
 run_windows.bat
 ```
 
-The web application will automatically:
-1. Install required dependencies
-2. Set up the environment file if not present
-3. Build the React frontend if needed
-4. Start the Flask server
+The Flask API uses `.env` by default. `/api/search` accepts optional local fields:
 
-On Windows, the script will automatically open your browser to http://localhost:5000.
-On Linux/Mac, you'll need to open your browser and navigate to http://localhost:5000 manually.
+```json
+{
+  "query": "roofing claims AI governance",
+  "num_results": 10,
+  "model": "llama3.1",
+  "llm_base_url": "http://localhost:11434/v1",
+  "searxng_url": "http://localhost:8080",
+  "tor_proxy": "socks5h://127.0.0.1:9050",
+  "allow_onion": true,
+  "aia_base_url": "http://localhost:3001",
+  "skip_aia": false
+}
+```
 
-### Advanced Options
+## AIA behavior
 
-Save the results to a file:
+When `AIA_BASE_URL` is set, the assistant:
+
+1. Calls `POST /verify` with a bounded statement summarizing the local OSINT run.
+2. Calls `POST /signals/ingest` with one signal per collected source.
+3. Records the result in `aia_receipt`.
+
+If local AIA is unavailable, the OSINT run still completes and the integration error is recorded.
+
+## Security notes
+
+- No cloud model providers are configured.
+- Tor/.onion support requires a local Tor proxy; it is not bundled.
+- Keep local API tokens and `.env` out of Git.
+- Treat all local LLM outputs and fetched source text as untrusted until independently verified.
+- Review logs and exported reports before sharing.
+
+## Development smoke checks
+
 ```bash
-python osint_assistant.py --query "quantum computing advances" --save
+python osint_assistant.py --list-providers
+python osint_assistant.py --query "https://example.com" --json --skip-aia
+python osint_web_app.py
 ```
-
-Specify the number of results to collect:
-```bash
-python osint_assistant.py --query "quantum computing advances" --results 15
-```
-
-Output results as JSON:
-```bash
-python osint_assistant.py --query "quantum computing advances" --json
-```
-
-Override the API key from environment file:
-```bash
-python osint_assistant.py --query "quantum computing advances" --api-key "your-api-key"
-```
-
-### Command Line Arguments
-
-| Argument | Short | Description |
-|----------|-------|-------------|
-| `--query` | `-q` | The search query to investigate |
-| `--results` | `-r` | Number of results to collect (default: 10) |
-| `--save` | `-s` | Save the collected data to a file |
-| `--api-key` | `-k` | Perplexity API key (overrides .env file) |
-| `--json` | `-j` | Output results as JSON |
-
-## API Key Setup
-
-This tool uses the Perplexity AI API for enhanced intelligence gathering and analysis. To use this feature:
-
-1. Sign up for an account at [Perplexity AI](https://www.perplexity.ai/)
-2. Navigate to the API section to generate an API key
-3. Add the key to your `.env` file or use the `--api-key` command line argument
-
-Note: The tool will still function without an API key, but will fall back to simulated data rather than real AI-powered analysis.
-
-## Data Models
-
-The tool uses Pydantic models for data validation and serialization:
-
-- `SearchResult`: Represents a single search result with title, URL, snippet, etc.
-- `ContentAnalysis`: Contains analysis of a specific URL including credibility, entities, and sentiment
-- `OSINTReport`: The complete report with all collected data and analyses
-
-## Contributing
-
-Contributions are welcome! Please feel free to submit a Pull Request.
-
-1. Fork the repository
-2. Create your feature branch (`git checkout -b feature/amazing-feature`)
-3. Commit your changes (`git commit -m 'Add some amazing feature'`)
-4. Push to the branch (`git push origin feature/amazing-feature`)
-5. Open a Pull Request
-
-### Development Guidelines
-
-When contributing to this project, please:
-
-1. Ensure code follows PEP 8 style guide for Python code
-2. Write unit tests for new features
-3. Update documentation as needed
-4. Make sure not to commit any API keys or sensitive information
-5. Verify that all tests pass before submitting a PR
-
-## Troubleshooting
-
-### Windows Users
-
-#### "No module named 'dotenv'" Error
-If you encounter this error when running the application:
-```
-ModuleNotFoundError: No module named 'dotenv'
-```
-
-There are several ways to fix this issue:
-
-1. **Run the diagnostic script** (most comprehensive):
-   ```
-   fix_windows_dotenv.bat
-   ```
-   This script will:
-   - Diagnose your Python environment
-   - Try multiple installation methods
-   - Provide detailed troubleshooting guidance
-
-2. **Use the included standalone module**:
-   No installation required - we've included a standalone `dotenv.py` file directly in the project folder. This will work even if pip fails.
-
-3. **Manual installation methods**:
-   ```
-   pip install python-dotenv
-   ```
-   or
-   ```
-   python -m pip install python-dotenv
-   ```
-   or
-   ```
-   pip install --user python-dotenv
-   ```
-
-4. **Administrator privileges**:
-   Run Command Prompt as Administrator, then try:
-   ```
-   pip install python-dotenv
-   ```
-
-5. **Multiple Python installations**:
-   If you have multiple Python versions, specify the version:
-   ```
-   py -3.9 -m pip install python-dotenv
-   ```
-
-#### Browser Not Opening Automatically
-When running the application directly with `python osint_web_app.py`, the browser may not open automatically. Use `run_windows.bat` instead to automatically open the browser with the application.
-
-### Linux/Mac Users
-
-#### "No module named 'dotenv'" or "module 'dotenv' has no attribute" Errors
-If you encounter either of these errors when running the application:
-```
-ModuleNotFoundError: No module named 'dotenv'
-```
-or
-```
-AttributeError: module 'dotenv' has no attribute 'dotenv_values'
-```
-
-There are several ways to fix this issue:
-
-1. **Run the diagnostic script** (recommended):
-   ```bash
-   ./fix_linux_dotenv.sh
-   ```
-   or if it's not executable:
-   ```bash
-   bash fix_linux_dotenv.sh
-   ```
-   This script will:
-   - Diagnose your Python environment
-   - Try multiple installation methods
-   - Check if the installed module has all required functions
-   - Provide Linux-specific troubleshooting guidance
-
-2. **Use the included standalone module**:
-   No installation required - we've included a standalone `dotenv.py` file directly in the project folder that implements all necessary functions including `dotenv_values`.
-
-3. **Manual installation methods**:
-   ```bash
-   pip install python-dotenv
-   ```
-   or
-   ```bash
-   pip3 install python-dotenv
-   ```
-   or
-   ```bash
-   sudo pip install python-dotenv
-   ```
-
-For general dependency issues, you can also run:
-```bash
-pip install -r requirements.txt
-```
-
-## Security Notes
-
-⚠️ **IMPORTANT**: This tool requires API keys to function properly.
-
-- Never commit your `.env` file with real API keys to GitHub
-- Always use the `.env.example` file as a template
-- Consider using GitHub Secrets for CI/CD workflows if adding automation
-
-## License
-
-This project is licensed under the MIT License - see the LICENSE file for details.
 
 ## Disclaimer
 
-This tool is for educational and research purposes only. Always ensure you comply with relevant laws and regulations when conducting OSINT research. The authors are not responsible for any misuse of this tool. 
+This tool is for educational, research, and authorized intelligence workflows only. Always comply with applicable laws, contracts, platform terms, and privacy obligations.
