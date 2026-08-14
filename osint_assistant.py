@@ -15,6 +15,8 @@ from pydantic import BaseModel, Field
 from rich.console import Console
 from rich.table import Table
 
+from siw_core import SIWRuntime, model_to_dict
+
 load_dotenv()
 
 DEFAULT_SYSTEM_PROMPT = """
@@ -30,6 +32,7 @@ class SearchResult(BaseModel):
     snippet: str
     source_type: str
     timestamp: str
+    evidence_id: Optional[str] = None
 
 
 class ContentAnalysis(BaseModel):
@@ -39,6 +42,7 @@ class ContentAnalysis(BaseModel):
     sentiment: str
     timestamps: Dict[str, str]
     connections: List[Dict[str, str]]
+    evidence_ids: List[str] = Field(default_factory=list)
 
 
 class ProviderRun(BaseModel):
@@ -62,6 +66,8 @@ class SourceFetch(BaseModel):
     http_status: Optional[int] = None
     title: Optional[str] = None
     text_excerpt: Optional[str] = None
+    content_hash_sha256: Optional[str] = None
+    evidence_id: Optional[str] = None
     error: Optional[str] = None
     via_tor: bool = False
 
@@ -97,6 +103,11 @@ def split_csv(value: Optional[str]) -> List[str]:
 def is_url(value: str) -> bool:
     parsed = urlparse(value)
     return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
+def route_for_url(url: str) -> str:
+    host = urlparse(url).hostname or ""
+    return "tor" if host.endswith(".onion") else "clearnet"
 
 
 @dataclass(frozen=True)
@@ -193,8 +204,7 @@ class SourceClient:
         self.user_agent = os.getenv("OSINT_USER_AGENT", "OSINT-Assistant/1.0 (+authorized research)")
 
     def proxies_for(self, url: str) -> Optional[Dict[str, str]]:
-        host = urlparse(url).hostname or ""
-        if host.endswith(".onion"):
+        if route_for_url(url) == "tor":
             if not self.allow_onion:
                 raise ValueError(".onion access is disabled. Set ALLOW_ONION=true to enable.")
             return {"http": self.tor_proxy, "https": self.tor_proxy}
@@ -202,15 +212,10 @@ class SourceClient:
 
     def fetch_url(self, url: str, timeout: int = 45) -> SourceFetch:
         if not self.internet_enabled:
-            return SourceFetch(url=url, status="disabled", error="Internet access disabled")
+            return SourceFetch(url=url, status="disabled", error="Internet access disabled", via_tor=route_for_url(url) == "tor")
         try:
             proxies = self.proxies_for(url)
-            response = requests.get(
-                url,
-                headers={"User-Agent": self.user_agent},
-                proxies=proxies,
-                timeout=timeout,
-            )
+            response = requests.get(url, headers={"User-Agent": self.user_agent}, proxies=proxies, timeout=timeout)
             response.raise_for_status()
             title, excerpt = self.extract_text(response.text)
             return SourceFetch(
@@ -219,10 +224,11 @@ class SourceClient:
                 http_status=response.status_code,
                 title=title,
                 text_excerpt=excerpt,
+                content_hash_sha256=hashlib.sha256(response.content).hexdigest(),
                 via_tor=bool(proxies),
             )
         except Exception as exc:  # noqa: BLE001
-            return SourceFetch(url=url, status="error", error=str(exc), via_tor=(urlparse(url).hostname or "").endswith(".onion"))
+            return SourceFetch(url=url, status="error", error=str(exc), via_tor=route_for_url(url) == "tor")
 
     def search(self, query: str, limit: int = 10) -> List[SearchResult]:
         if not self.internet_enabled or not self.searxng_url:
@@ -299,13 +305,7 @@ class AIAClient:
                     "domain": "osint.research",
                     "entity_id": urlparse(url).netloc or "unknown",
                     "timestamp": now,
-                    "value": {
-                        "query": query,
-                        "title": result.get("title"),
-                        "url": url,
-                        "snippet": result.get("snippet"),
-                        "source_type": result.get("source_type"),
-                    },
+                    "value": result,
                     "value_type": "json",
                     "confidence": 0.5,
                     "metadata": {"source_url": url, "tool": "OSINT-Assistant", "llm_mode": "local-only"},
@@ -344,6 +344,8 @@ class JsonHelper:
 class OSINTAssistant:
     def __init__(
         self,
+        case_id: Optional[str] = None,
+        runtime: Optional[SIWRuntime] = None,
         api_key: Optional[str] = None,
         providers: Optional[Sequence[str]] = None,
         model: Optional[str] = None,
@@ -354,6 +356,8 @@ class OSINTAssistant:
         source_client: Optional[SourceClient] = None,
     ):
         self.console = Console()
+        self.case_id = case_id
+        self.runtime = runtime or SIWRuntime()
         self.api_client = ApiClient(api_key=api_key, providers=providers, model=model, base_url=llm_base_url)
         self.source_client = source_client or SourceClient()
         self.aia_client = AIAClient(aia_base_url, aia_api_key) if enable_aia else None
@@ -364,18 +368,19 @@ class OSINTAssistant:
         self.aia_receipt: Optional[AIAReceipt] = None
 
     def ask_ai(self, query: str, system_prompt: Optional[str] = None, max_tokens: int = 2000) -> Optional[str]:
+        self.runtime.policy_decision_for(self.case_id, "model_inference", "local-llm", "none")
         messages = [{"role": "system", "content": system_prompt or DEFAULT_SYSTEM_PROMPT}, {"role": "user", "content": query}]
         response = self.api_client.call_api(messages, max_tokens=max_tokens)
         self.provider_runs.extend(self.api_client.provider_runs)
         return response
 
     def search_web(self, query: str, num_results: int = 10) -> List[SearchResult]:
-        self.console.print(f"[bold blue]Searching locally with internet/Tor enabled for:[/bold blue] {query}")
+        self.runtime.require_case(self.case_id)
+        self.console.print(f"[bold blue]Searching with SIW policy gate for:[/bold blue] {query}")
         if is_url(query):
-            fetch = self.source_client.fetch_url(query)
-            self.source_fetches.append(fetch)
-            results = [self.result_from_fetch(fetch)]
+            results = [self.fetch_as_result(query)]
         else:
+            self.runtime.policy_decision_for(self.case_id, "search", query, "clearnet")
             results = self.source_client.search(query, num_results)
             if not results:
                 results = self._perform_local_candidate_search(query, num_results)
@@ -383,6 +388,24 @@ class OSINTAssistant:
         self._send_to_aia(query)
         self.console.print(f"[green]Found {len(self.collected_data)} results[/green]")
         return results
+
+    def fetch_as_result(self, url: str) -> SearchResult:
+        route = route_for_url(url)
+        action = "tor_fetch" if route == "tor" else "fetch"
+        decision = self.runtime.policy_decision_for(self.case_id, action, url, route)  # type: ignore[arg-type]
+        fetch = self.source_client.fetch_url(url)
+        if fetch.status == "ok":
+            evidence = self.runtime.record_evidence(
+                case_id=self.case_id,  # type: ignore[arg-type]
+                source_locator=url,
+                route_type=route,  # type: ignore[arg-type]
+                content=(fetch.text_excerpt or "").encode("utf-8"),
+                normalized_text=fetch.text_excerpt or "",
+                policy_decision_id=decision.decision_id,
+            )
+            fetch.evidence_id = evidence.evidence_id
+        self.source_fetches.append(fetch)
+        return self.result_from_fetch(fetch)
 
     def _perform_local_candidate_search(self, query: str, num_results: int) -> List[SearchResult]:
         system_prompt = f"""
@@ -420,14 +443,19 @@ is unknown, use https://example.invalid/source-needed and say source lookup is r
             snippet=fetch.text_excerpt or fetch.error or "",
             source_type="Tor/.onion" if fetch.via_tor else "Internet URL",
             timestamp=datetime.now().strftime("%Y-%m-%d"),
+            evidence_id=fetch.evidence_id,
         )
 
     def analyze_content(self, url: str) -> Optional[ContentAnalysis]:
+        self.runtime.require_case(self.case_id)
         self.console.print(f"[bold blue]Analyzing source:[/bold blue] {url}")
-        fetch = self.source_client.fetch_url(url) if is_url(url) else None
-        if fetch:
-            self.source_fetches.append(fetch)
-        source_text = fetch.text_excerpt if fetch and fetch.text_excerpt else ""
+        evidence_ids = []
+        source_text = ""
+        if is_url(url):
+            result = self.fetch_as_result(url)
+            source_text = result.snippet
+            if result.evidence_id:
+                evidence_ids.append(result.evidence_id)
         system_prompt = """
 Return ONLY JSON with: domain, credibility_score, key_entities, sentiment,
 timestamps {published,last_updated}, and connections [{from,to,relationship}].
@@ -436,10 +464,24 @@ Use UNKNOWN/N/A where the source does not support a claim.
         content = self.ask_ai(f"Analyze this OSINT source URL: {url}\n\nSource excerpt:\n{source_text[:2500]}", system_prompt)
         parsed = JsonHelper.extract_json_from_text(content or "", self.console) if content else None
         analysis = parsed if isinstance(parsed, dict) else self._generate_local_analysis(url, urlparse(url).netloc)
-        normalized = self._normalize_analysis(analysis, url)
+        normalized = self._normalize_analysis(analysis, url, evidence_ids)
         content_analysis = ContentAnalysis(**normalized)
         self.analysis_results[url] = model_dump(content_analysis)
         return content_analysis
+
+    def create_claim(self, statement: str, evidence_ids: List[str], confidence: float, contradictions: Optional[List[str]] = None):
+        return self.runtime.create_claim(
+            case_id=self.case_id,  # type: ignore[arg-type]
+            statement=statement,
+            evidence_ids=evidence_ids,
+            confidence=confidence,
+            created_by="local-llm",
+            contradictions=contradictions or [],
+            model_metadata={"provider": "local", "runs": [model_dump(run) for run in self.provider_runs[-3:]]},
+        )
+
+    def export_decision_package(self, approved_by: str, reason: str):
+        return self.runtime.export_decision_package(self.case_id, approved_by, reason)  # type: ignore[arg-type]
 
     def _send_to_aia(self, query: str) -> None:
         if not self.aia_client or not self.aia_client.enabled:
@@ -447,7 +489,7 @@ Use UNKNOWN/N/A where the source does not support a claim.
             return
         try:
             verification = self.aia_client.verify(
-                f"Local OSINT Assistant collected {len(self.collected_data)} candidate sources for query: {query}"[:4000]
+                f"SIW case {self.case_id} collected {len(self.collected_data)} candidate sources for query: {query}"[:4000]
             )
             inserted = self.aia_client.ingest_results(query, self.collected_data)
             self.aia_receipt = AIAReceipt(True, self.aia_client.base_url, verification, inserted)
@@ -460,21 +502,22 @@ Use UNKNOWN/N/A where the source does not support a claim.
             collected_data=[SearchResult(**item) for item in self.collected_data],
             analysis_results=self.analysis_results,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            query_info={"query": query, "results_requested": results_requested, "results_found": len(self.collected_data), "mode": "local-llm-internet-tor"},
+            query_info={"query": query, "case_id": self.case_id, "results_requested": results_requested, "results_found": len(self.collected_data), "mode": "siw-local-llm-internet-tor"},
             source_fetches=self.source_fetches,
             provider_runs=self.provider_runs,
             aia_receipt=self.aia_receipt,
         )
 
     def generate_report(self) -> None:
-        self.console.print("\n[bold yellow]===== LOCAL OSINT ANALYSIS REPORT =====[/bold yellow]")
+        self.console.print("\n[bold yellow]===== SIW LOCAL OSINT ANALYSIS REPORT =====[/bold yellow]")
         table = Table(title="Data Collection Summary")
+        table.add_column("Evidence", style="magenta")
         table.add_column("Source", style="cyan")
         table.add_column("Type", style="green")
         table.add_column("Credibility", style="yellow")
         for item in self.collected_data:
             domain = urlparse(item["url"]).netloc
-            table.add_row(domain, item["source_type"], f"{self._calculate_credibility(domain):.2f}")
+            table.add_row(str(item.get("evidence_id") or "—"), domain, item["source_type"], f"{self._calculate_credibility(domain):.2f}")
         self.console.print(table)
         self.console.print("\n[bold blue]Local / Internet / Tor / AIA Status:[/bold blue]")
         for run in self.provider_runs[-12:]:
@@ -483,7 +526,7 @@ Use UNKNOWN/N/A where the source does not support a claim.
         for fetch in self.source_fetches[-12:]:
             detail = f" — {fetch.error}" if fetch.error else ""
             route = "Tor" if fetch.via_tor else "Internet"
-            self.console.print(f"- {route} fetch {fetch.url} — {fetch.status.upper()}{detail}")
+            self.console.print(f"- {route} fetch {fetch.url} — {fetch.status.upper()} evidence={fetch.evidence_id or '—'}{detail}")
         if self.aia_receipt:
             if self.aia_receipt.enabled and not self.aia_receipt.error:
                 self.console.print(f"- AIA — OK; signals ingested: {self.aia_receipt.signals_ingested}")
@@ -497,7 +540,7 @@ Use UNKNOWN/N/A where the source does not support a claim.
             handle.write(model_dump_json(self.build_report(), indent=4))
         self.console.print(f"[green]Data saved to {filename}[/green]")
 
-    def _normalize_analysis(self, analysis: Dict[str, Any], url: str) -> Dict[str, Any]:
+    def _normalize_analysis(self, analysis: Dict[str, Any], url: str, evidence_ids: List[str]) -> Dict[str, Any]:
         domain = analysis.get("domain") if isinstance(analysis.get("domain"), str) else urlparse(url).netloc
         try:
             score = max(0.0, min(1.0, float(analysis.get("credibility_score", 0.5))))
@@ -514,6 +557,7 @@ Use UNKNOWN/N/A where the source does not support a claim.
             "sentiment": sentiment,
             "timestamps": {"published": str(timestamps.get("published", "N/A")), "last_updated": str(timestamps.get("last_updated", "N/A"))},
             "connections": [conn for conn in connections if isinstance(conn, dict)] or [{"from": "UNKNOWN", "to": "UNKNOWN", "relationship": "source did not verify"}],
+            "evidence_ids": evidence_ids,
         }
 
     def _calculate_credibility(self, domain: str) -> float:
@@ -538,7 +582,7 @@ Use UNKNOWN/N/A where the source does not support a claim.
         return [
             {
                 "title": f"Source lookup required for {query}",
-                "url": f"https://example.invalid/source-needed?q={encoded}&n={index + 1}",
+                "url": f"{{https://example.invalid/source-needed?q={encoded}}}&n={index + 1}",
                 "snippet": "Configure SEARXNG_URL for clearnet search, provide a direct URL, or provide a .onion URL with Tor running on TOR_PROXY.",
                 "source_type": "Source lookup required",
                 "timestamp": datetime.now().strftime("%Y-%m-%d"),
@@ -547,11 +591,39 @@ Use UNKNOWN/N/A where the source does not support a claim.
         ]
 
 
+def create_or_load_case(args: argparse.Namespace, runtime: SIWRuntime) -> Optional[str]:
+    if args.case_id:
+        runtime.require_case(args.case_id)
+        return args.case_id
+    if args.create_case:
+        if not args.authorized_purpose:
+            raise ValueError("--authorized-purpose is required with --create-case")
+        case = runtime.create_case(
+            title=args.case_title or args.query or "SIW Investigation",
+            authorized_purpose=args.authorized_purpose,
+            owner=args.owner,
+            policy_profile=args.policy_profile,
+            scope={"source_rules": args.source_rules, "target": args.query},
+        )
+        return case.case_id
+    return None
+
+
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local OSINT Assistant with internet/Tor source access and local AIA integration")
+    parser = argparse.ArgumentParser(description="Sovereign Intelligence Workstation local OSINT runtime")
     parser.add_argument("--query", "-q", type=str, help="Search query or direct http(s)/.onion URL")
+    parser.add_argument("--case-id", type=str, help="Existing SIW case ID. Required unless --create-case is used")
+    parser.add_argument("--create-case", action="store_true", help="Create a case before running")
+    parser.add_argument("--case-title", type=str, help="Case title when creating a case")
+    parser.add_argument("--authorized-purpose", type=str, help="Authorized purpose statement for the case")
+    parser.add_argument("--owner", type=str, default=os.getenv("USER", "local_operator"), help="Case owner/operator")
+    parser.add_argument("--policy-profile", choices=["local_only", "clearnet_authorized", "tor_authorized", "airgapped_review"], default="clearnet_authorized")
+    parser.add_argument("--source-rules", type=str, default="authorized public-source collection only")
     parser.add_argument("--results", "-r", type=int, default=10, help="Number of results to collect")
     parser.add_argument("--save", "-s", action="store_true", help="Save collected data to JSON")
+    parser.add_argument("--export-package", action="store_true", help="Export a DecisionPackage after the run")
+    parser.add_argument("--approved-by", type=str, default=os.getenv("USER", "local_operator"))
+    parser.add_argument("--approval-reason", type=str, default="Operator-approved export")
     parser.add_argument("--api-key", "-k", type=str, help="Optional local endpoint API key")
     parser.add_argument("--providers", type=str, help="Accepted for compatibility; only 'local' is used")
     parser.add_argument("--model", type=str, help="Local model name, e.g. llama3.1")
@@ -570,7 +642,14 @@ def main() -> None:
         print("Please provide a search query or URL using --query or -q")
         return
 
+    runtime = SIWRuntime(requested_by=args.owner)
+    case_id = create_or_load_case(args, runtime)
+    if not case_id:
+        raise SystemExit("Denied: --case-id or --create-case with --authorized-purpose is required")
+
     assistant = OSINTAssistant(
+        case_id=case_id,
+        runtime=runtime,
         api_key=args.api_key,
         providers=split_csv(args.providers),
         model=args.model,
@@ -582,6 +661,9 @@ def main() -> None:
     assistant.search_web(args.query, args.results)
     for item in assistant.collected_data:
         assistant.analyze_content(item["url"])
+    if args.export_package:
+        package_path = assistant.export_decision_package(args.approved_by, args.approval_reason)
+        print(f"DecisionPackage exported: {package_path}")
     if args.json:
         print(model_dump_json(assistant.build_report(args.query, args.results), indent=2))
     else:
