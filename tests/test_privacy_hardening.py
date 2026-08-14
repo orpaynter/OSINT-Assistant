@@ -179,7 +179,7 @@ class TestDirectMode(unittest.TestCase):
 
 class TestEndpointEnforcement(unittest.TestCase):
 
-    def test_remote_llm_endpoint_rejected_by_default(self, monkeypatch=None):
+    def test_remote_llm_endpoint_rejected_by_default(self):
         """ApiClient must reject a non-loopback LLM URL unless opt-in env is set."""
         from osint_assistant import ApiClient
         with patch.dict(os.environ, {"OSINT_ALLOW_REMOTE_ENDPOINTS": "false", "LOCAL_BASE_URL": "https://api.openai.com/v1"}):

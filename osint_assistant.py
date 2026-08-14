@@ -305,7 +305,7 @@ class ApiClient:
             endpoint = f"{endpoint}/chat/completions"
         response = requests.post(
             endpoint,
-            headers={"Authorization": f"******", "content-type": "application/json"},
+            headers={"Authorization": "Bearer " + api_key, "content-type": "application/json"},
             json={"model": model, "messages": messages, "temperature": temperature, "max_tokens": max_tokens},
             timeout=90,
         )
@@ -563,7 +563,7 @@ class AIAClient:
     def headers(self) -> Dict[str, str]:
         headers = {"content-type": "application/json", "accept": "application/json"}
         if self.api_key:
-            headers["Authorization"] = f"******"
+            headers["Authorization"] = "Bearer " + self.api_key
         return headers
 
     def verify(self, statement: str) -> Dict[str, Any]:
