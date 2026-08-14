@@ -1,21 +1,40 @@
 # OSINT Assistant
 
-Local-first OSINT assistant for public-source research. This version uses a **local LLM**, connects to the **internet**, supports **Tor/.onion dark-web source access**, and can send governed verification/signal receipts to **local AIA**.
+Local-first, privacy-preserving OSINT assistant for **authorized public-source research**.
+Runs inference locally, routes outbound source requests through Tor by default, and never
+binds the web UI beyond localhost unless explicitly configured.
+
+## Threat model and privacy architecture
+
+| Category | What happens | What to know |
+|---|---|---|
+| **Local inference** | LLM and AIA run on this machine only. | No query or result leaves to a remote AI provider. |
+| **Outbound source requests** | Fetching clearnet/onion URLs contacts those remote servers. | In `strict` mode (default) all such requests route through a local Tor SOCKS proxy using `socks5h` (remote DNS). |
+| **Tor-routed privacy mode** | Tor hides your IP from the target source server. | Tor **does not guarantee anonymity**. Timing attacks, misconfigured onion services, and application-layer leaks can still expose identity. |
+| **Direct mode** | `PRIVACY_MODE=direct` disables Tor routing. | A visible warning is emitted on every request. Your IP is exposed to target servers. |
+| **Fail-closed** | In `strict` mode, if the Tor proxy is unavailable the request fails — it does **not** silently fall back to direct. | Ensure `tor` is running before using strict mode. |
+| **Local services** | LLM, AIA, and local SearXNG communicate direct (loopback). | Only loopback endpoints are accepted by default; `OSINT_ALLOW_REMOTE_ENDPOINTS=true` unlocks remote endpoints at operator's risk. |
+| **SSRF protection** | User-supplied source URLs are validated; loopback, private, link-local, cloud-metadata, and non-HTTP(S) URLs are blocked before any request is sent, including after redirect hops. | |
+| **Legality** | This software is for **authorized, lawful public-source research only**. | It cannot make illegal activity safe or legal. Do not use to access stolen data, bypass authentication, or exploit systems. |
 
 ## Local architecture
 
 ```text
 OSINT Assistant
-  -> clearnet fetch / optional local SearXNG search
-  -> Tor SOCKS proxy for .onion URLs
-  -> local OpenAI-compatible LLM endpoint
-  -> local AIA /verify and /signals/ingest
-  -> JSON report with source fetches + provider status + AIA receipt
+  -> clearnet fetch / optional local SearXNG search (→ Tor in strict mode)
+  -> Tor SOCKS proxy (socks5h) for .onion URLs and clearnet in strict mode
+  -> local OpenAI-compatible LLM endpoint (loopback only)
+  -> local AIA /verify and /signals/ingest (loopback only)
+  -> JSON report with source fetches + privacy receipt + provider status + AIA receipt
 ```
 
-Defaults:
+Defaults (privacy-first):
 
 ```env
+PRIVACY_MODE=strict          # all clearnet routed through Tor; fail-closed
+OSINT_BIND_HOST=127.0.0.1    # web UI only reachable from localhost
+FLASK_DEBUG=false
+ALLOW_ONION=false            # enable explicitly when Tor is running
 LOCAL_BASE_URL=http://localhost:11434/v1
 LOCAL_MODEL=llama3.1
 SEARXNG_URL=http://localhost:8080
