@@ -5,9 +5,15 @@ from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
 
 from osint_assistant import OSINTAssistant, SourceClient, model_dump, split_csv
+from siw_core import SIWRuntime
 
 app = Flask(__name__)
-CORS(app)
+CORS(
+    app,
+    resources={r"/api/*": {"origins": ["http://127.0.0.1", "http://localhost"]}},
+    methods=["POST"],
+    allow_headers=["Content-Type", "Authorization"],
+)
 
 APP_HTML = """
 <!doctype html>
@@ -36,6 +42,8 @@ APP_HTML = """
           <label class="grid gap-2"><span class="text-sm font-semibold">Tor proxy</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="tor_proxy" placeholder="socks5h://127.0.0.1:9050"></label>
           <label class="grid gap-2"><span class="text-sm font-semibold">AIA base URL</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="aia_base_url" placeholder="http://localhost:3001"></label>
           <label class="grid gap-2"><span class="text-sm font-semibold">Results</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="num_results" type="number" min="1" max="50" value="10"></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">SIW case ID</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="case_id" required placeholder="case_..."></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">Authorized purpose</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="authorized_purpose" required placeholder="Approved investigation purpose"></label>
           <label class="flex items-center gap-3"><input name="allow_onion" type="checkbox" checked><span class="text-sm">Allow .onion via Tor</span></label>
           <label class="flex items-center gap-3"><input name="skip_aia" type="checkbox"><span class="text-sm">Skip AIA for this run</span></label>
         </div>
@@ -71,6 +79,19 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     query = payload.get("query")
     if not query:
         raise ValueError("No query provided")
+    case_id = payload.get("case_id")
+    authorized_purpose = (payload.get("authorized_purpose") or "").strip()
+    runtime = SIWRuntime(requested_by="web_operator")
+    try:
+        case = runtime.require_case(case_id)
+    except (PermissionError, ValueError) as exc:
+        raise PermissionError(f"Policy denied: {exc}") from exc
+    if not authorized_purpose:
+        raise PermissionError("Policy denied: authorized_purpose is required")
+    if case.authorized_purpose.strip() != authorized_purpose:
+        raise PermissionError("Policy denied: authorized_purpose does not match case authorization")
+    if case.status != "open":
+        raise PermissionError("Policy denied: case is not open")
     source_client = SourceClient(
         allow_onion=payload.get("allow_onion", True) not in {False, "false", "False", "0", "off"},
         tor_proxy=payload.get("tor_proxy") or None,
@@ -85,6 +106,8 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         aia_api_key=payload.get("aia_api_key") or None,
         enable_aia=not bool(payload.get("skip_aia")),
         source_client=source_client,
+        case_id=case.case_id,
+        runtime=runtime,
     )
     num_results = int(payload.get("num_results", 10))
     assistant.search_web(query, num_results)
@@ -106,8 +129,27 @@ def search():
     try:
         report = run_search(payload)
         return render_template_string(APP_HTML, query=payload.get("query"), report=report, error=None, current_year=datetime.now().year)
+    except PermissionError as exc:
+        _ = exc
+        return (
+            render_template_string(
+                APP_HTML,
+                query=payload.get("query"),
+                report=None,
+                error="Policy denied",
+                current_year=datetime.now().year,
+            ),
+            403,
+        )
     except Exception as exc:  # noqa: BLE001
-        return render_template_string(APP_HTML, query=payload.get("query"), report=None, error=str(exc), current_year=datetime.now().year)
+        _ = exc
+        return render_template_string(
+            APP_HTML,
+            query=payload.get("query"),
+            report=None,
+            error="Internal server error",
+            current_year=datetime.now().year,
+        )
 
 
 @app.route("/api/search", methods=["POST"])
@@ -116,9 +158,19 @@ def api_search():
         return jsonify(run_search(request.json or {}))
     except ValueError as exc:
         return jsonify({"error": str(exc)}), 400
+    except PermissionError as exc:
+        _ = exc
+        return jsonify({"error": "Policy denied"}), 403
     except Exception as exc:  # noqa: BLE001
-        return jsonify({"error": str(exc)}), 500
+        _ = exc
+        return jsonify({"error": "Internal server error"}), 500
+
+
+def run_server(host: str = "127.0.0.1", port: int = 5000, debug: bool = False) -> None:
+    if host != "127.0.0.1" or debug:
+        raise ValueError("Server must run on 127.0.0.1 with debug disabled")
+    app.run(debug=False, host="127.0.0.1", port=port)
 
 
 if __name__ == "__main__":
-    app.run(debug=True, host="0.0.0.0", port=5000)
+    run_server()

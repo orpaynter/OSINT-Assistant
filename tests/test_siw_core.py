@@ -108,7 +108,13 @@ def test_decision_package_verifies_and_fails_after_tamper(tmp_path):
         created_by="tester",
     )
     runtime.accept_claim(case.case_id, claim.claim_id, "Evidence linked")
-    package_path = runtime.export_decision_package(case.case_id, approved_by="tester", reason="Demo export")
+    receipt = runtime.record_human_approval_receipt(
+        case_id=case.case_id,
+        action_type="evidence_export",
+        approved_by="tester",
+        reason="Demo export",
+    )
+    package_path = runtime.export_decision_package(case.case_id, approval_receipt_id=receipt.approval_id)
     assert DecisionPackageVerifier.verify(package_path).ok is True
 
     package = json.loads(package_path.read_text(encoding="utf-8"))
@@ -125,3 +131,28 @@ def test_audit_history_is_append_only(tmp_path):
     runtime.policy_decision_for(case.case_id, "fetch", "https://example.com", "clearnet")
     runtime.policy_decision_for(case.case_id, "fetch", "https://example.org", "clearnet")
     assert len(runtime.store.load_all("policy_decisions")) == 2
+
+
+def test_export_fails_without_verified_governance_receipt(tmp_path):
+    runtime = make_runtime(tmp_path)
+    case = runtime.create_case("Package export", "Authorized research", "tester", "clearnet_authorized")
+    with pytest.raises(PermissionError):
+        runtime.export_decision_package(case.case_id, approval_receipt_id="missing")
+
+
+def test_caller_approved_by_cannot_mint_decision_package(tmp_path):
+    runtime = make_runtime(tmp_path)
+    case = runtime.create_case("Package export", "Authorized research", "tester", "clearnet_authorized")
+    receipt = runtime.record_human_approval_receipt(
+        case_id=case.case_id,
+        action_type="evidence_export",
+        approved_by="governance-user",
+        reason="Approved",
+    )
+    with pytest.raises(PermissionError):
+        runtime.export_decision_package(
+            case.case_id,
+            approval_receipt_id=receipt.approval_id,
+            approved_by="attacker",
+            reason="self-approve",
+        )
