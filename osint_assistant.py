@@ -1,5 +1,7 @@
 import argparse
+import base64
 import hashlib
+import ipaddress
 import json
 import os
 import re
@@ -67,6 +69,7 @@ class SourceFetch(BaseModel):
     title: Optional[str] = None
     text_excerpt: Optional[str] = None
     content_hash_sha256: Optional[str] = None
+    raw_content_base64: Optional[str] = None
     evidence_id: Optional[str] = None
     error: Optional[str] = None
     via_tor: bool = False
@@ -210,10 +213,38 @@ class SourceClient:
             return {"http": self.tor_proxy, "https": self.tor_proxy}
         return None
 
+    @staticmethod
+    def _is_restricted_host(hostname: Optional[str]) -> bool:
+        if not hostname:
+            return True
+        host = hostname.strip().lower()
+        if host in {"localhost", "127.0.0.1", "::1"} or host.endswith(".local"):
+            return True
+        try:
+            ip = ipaddress.ip_address(host)
+            return (
+                ip.is_private
+                or ip.is_loopback
+                or ip.is_link_local
+                or ip.is_multicast
+                or ip.is_reserved
+                or ip.is_unspecified
+            )
+        except ValueError:
+            return False
+
+    def _validate_fetch_target(self, url: str) -> None:
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            raise ValueError("Denied fetch target: only http(s) URLs are allowed")
+        if self._is_restricted_host(parsed.hostname):
+            raise ValueError("Denied fetch target: restricted host")
+
     def fetch_url(self, url: str, timeout: int = 45) -> SourceFetch:
         if not self.internet_enabled:
             return SourceFetch(url=url, status="disabled", error="Internet access disabled", via_tor=route_for_url(url) == "tor")
         try:
+            self._validate_fetch_target(url)
             proxies = self.proxies_for(url)
             response = requests.get(url, headers={"User-Agent": self.user_agent}, proxies=proxies, timeout=timeout)
             response.raise_for_status()
@@ -225,6 +256,7 @@ class SourceClient:
                 title=title,
                 text_excerpt=excerpt,
                 content_hash_sha256=hashlib.sha256(response.content).hexdigest(),
+                raw_content_base64=base64.b64encode(response.content).decode("ascii"),
                 via_tor=bool(proxies),
             )
         except Exception as exc:  # noqa: BLE001
@@ -395,11 +427,14 @@ class OSINTAssistant:
         decision = self.runtime.policy_decision_for(self.case_id, action, url, route)  # type: ignore[arg-type]
         fetch = self.source_client.fetch_url(url)
         if fetch.status == "ok":
+            if not fetch.raw_content_base64:
+                raise ValueError("Fetched content missing raw bytes artifact")
+            raw_bytes = base64.b64decode(fetch.raw_content_base64)
             evidence = self.runtime.record_evidence(
                 case_id=self.case_id,  # type: ignore[arg-type]
                 source_locator=url,
                 route_type=route,  # type: ignore[arg-type]
-                content=(fetch.text_excerpt or "").encode("utf-8"),
+                content=raw_bytes,
                 normalized_text=fetch.text_excerpt or "",
                 policy_decision_id=decision.decision_id,
             )
@@ -480,14 +515,17 @@ Use UNKNOWN/N/A where the source does not support a claim.
             model_metadata={"provider": "local", "runs": [model_dump(run) for run in self.provider_runs[-3:]]},
         )
 
-    def export_decision_package(self, approved_by: str, reason: str):
-        return self.runtime.export_decision_package(self.case_id, approved_by, reason)  # type: ignore[arg-type]
+    def export_decision_package(
+        self, approval_receipt_id: str, approved_by: Optional[str] = None, reason: Optional[str] = None
+    ):
+        return self.runtime.export_decision_package(self.case_id, approval_receipt_id, approved_by, reason)  # type: ignore[arg-type]
 
     def _send_to_aia(self, query: str) -> None:
         if not self.aia_client or not self.aia_client.enabled:
             self.aia_receipt = AIAReceipt(enabled=False)
             return
         try:
+            self.runtime.policy_decision_for(self.case_id, "external_share", "aia_ingest", "none")
             verification = self.aia_client.verify(
                 f"SIW case {self.case_id} collected {len(self.collected_data)} candidate sources for query: {query}"[:4000]
             )
@@ -622,8 +660,9 @@ def main() -> None:
     parser.add_argument("--results", "-r", type=int, default=10, help="Number of results to collect")
     parser.add_argument("--save", "-s", action="store_true", help="Save collected data to JSON")
     parser.add_argument("--export-package", action="store_true", help="Export a DecisionPackage after the run")
-    parser.add_argument("--approved-by", type=str, default=os.getenv("USER", "local_operator"))
-    parser.add_argument("--approval-reason", type=str, default="Operator-approved export")
+    parser.add_argument("--approval-receipt-id", type=str, help="Verified governance approval receipt ID for export")
+    parser.add_argument("--approved-by", type=str, help="Optional cross-check against receipt approver")
+    parser.add_argument("--approval-reason", type=str, help="Optional cross-check against receipt reason")
     parser.add_argument("--api-key", "-k", type=str, help="Optional local endpoint API key")
     parser.add_argument("--providers", type=str, help="Accepted for compatibility; only 'local' is used")
     parser.add_argument("--model", type=str, help="Local model name, e.g. llama3.1")
@@ -662,7 +701,9 @@ def main() -> None:
     for item in assistant.collected_data:
         assistant.analyze_content(item["url"])
     if args.export_package:
-        package_path = assistant.export_decision_package(args.approved_by, args.approval_reason)
+        if not args.approval_receipt_id:
+            raise SystemExit("Denied: --approval-receipt-id is required with --export-package")
+        package_path = assistant.export_decision_package(args.approval_receipt_id, args.approved_by, args.approval_reason)
         print(f"DecisionPackage exported: {package_path}")
     if args.json:
         print(model_dump_json(assistant.build_report(args.query, args.results), indent=2))

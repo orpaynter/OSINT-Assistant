@@ -119,6 +119,8 @@ class HumanApproval(BaseModel):
     action_type: str
     approved_by: str
     reason: str
+    issued_by: str = "governance"
+    verified: bool = False
     timestamp: str = Field(default_factory=utc_now)
 
 
@@ -195,7 +197,7 @@ class PolicyGate:
         requested_by: str,
         route_type: RouteType = "none",
     ) -> PolicyDecision:
-        allow, reason = self._evaluate(case, action_type, route_type)
+        allow, reason = self._evaluate(case, action_type, target, route_type)
         decision = PolicyDecision(
             case_id=case.case_id,
             action_type=action_type,
@@ -208,7 +210,7 @@ class PolicyGate:
         self.store.append("policy_decisions", decision)
         return decision
 
-    def _evaluate(self, case: InvestigationCase, action_type: str, route_type: RouteType) -> tuple[bool, str]:
+    def _evaluate(self, case: InvestigationCase, action_type: str, target: str, route_type: RouteType) -> tuple[bool, str]:
         allowed_actions = {
             "search",
             "fetch",
@@ -233,7 +235,10 @@ class PolicyGate:
         if route_type == "clearnet" and case.policy_profile not in {"clearnet_authorized", "tor_authorized"}:
             return False, "clearnet route requires network-authorized profile"
         if action_type == "external_share":
-            return False, "external share requires a separate explicit approval grant"
+            allowed_targets = case.scope.get("allow_external_share_targets", [])
+            if not isinstance(allowed_targets, list) or target not in allowed_targets:
+                return False, "external share requires explicit per-target policy allow"
+            return True, "allowed by explicit external share target policy"
         return True, "allowed by SIW policy profile"
 
 
@@ -351,19 +356,80 @@ class SIWRuntime:
                 return claim
         raise ValueError(f"Unknown claim ID: {claim_id}")
 
-    def export_decision_package(self, case_id: str, approved_by: str, reason: str) -> Path:
+    def record_human_approval_receipt(
+        self,
+        case_id: str,
+        action_type: str,
+        approved_by: str,
+        reason: str,
+        issued_by: str = "governance",
+        verified: bool = True,
+    ) -> HumanApproval:
+        self.require_case(case_id)
+        approval = HumanApproval(
+            case_id=case_id,
+            action_type=action_type,
+            approved_by=approved_by,
+            reason=reason,
+            issued_by=issued_by,
+            verified=verified,
+        )
+        self.store.append("human_approvals", approval)
+        return approval
+
+    def _load_verified_governance_receipt(self, case_id: str, approval_receipt_id: str) -> HumanApproval:
+        matching: list[HumanApproval] = []
+        for item in self.store.load_all("human_approvals"):
+            if item.get("case_id") != case_id:
+                continue
+            if item.get("approval_id") != approval_receipt_id:
+                continue
+            approval = HumanApproval(**item)
+            if approval.action_type != "evidence_export":
+                continue
+            if approval.issued_by != "governance":
+                continue
+            if not approval.verified:
+                continue
+            matching.append(approval)
+        if not matching:
+            raise PermissionError("Export denied: missing verified governance approval receipt")
+        if len(matching) > 1:
+            raise PermissionError("Export denied: duplicate governance approval receipts")
+        return matching[0]
+
+    def export_decision_package(
+        self,
+        case_id: str,
+        approval_receipt_id: str,
+        approved_by: Optional[str] = None,
+        reason: Optional[str] = None,
+    ) -> Path:
         case = self.require_case(case_id)
-        decision = self.policy_gate.decide(case, "evidence_export", case_id, approved_by, "none")
+        decision = self.policy_gate.decide(case, "evidence_export", case_id, self.requested_by, "none")
         if not decision.allow:
             raise PermissionError(decision.reason)
-        approval = HumanApproval(case_id=case_id, action_type="evidence_export", approved_by=approved_by, reason=reason)
-        self.store.append("human_approvals", approval)
+        approval = self._load_verified_governance_receipt(case_id, approval_receipt_id)
+        if approved_by and approved_by != approval.approved_by:
+            raise PermissionError("Export denied: caller approved_by does not match verified receipt")
+        if reason and reason != approval.reason:
+            raise PermissionError("Export denied: caller reason does not match verified receipt")
+        unique_approvals: list[HumanApproval] = []
+        seen_approval_ids: set[str] = set()
+        for item in self.store.load_all("human_approvals"):
+            if item.get("case_id") != case_id:
+                continue
+            candidate = HumanApproval(**item)
+            if candidate.approval_id in seen_approval_ids:
+                continue
+            seen_approval_ids.add(candidate.approval_id)
+            unique_approvals.append(candidate)
         package = DecisionPackage(
             case=case,
             evidence_manifest=[EvidenceRecord(**item) for item in self.store.load_all("evidence") if item.get("case_id") == case_id],
             claims=[Claim(**item) for item in self.store.load_all("claims") if item.get("case_id") == case_id],
             policy_decisions=[PolicyDecision(**item) for item in self.store.load_all("policy_decisions") if item.get("case_id") == case_id],
-            human_approvals=[HumanApproval(**item) for item in self.store.load_all("human_approvals") if item.get("case_id") == case_id] + [approval],
+            human_approvals=unique_approvals,
             verification_instructions="Run: python siw_verify.py <package.json>. This checks package and evidence hashes locally without external services.",
         )
         package_dict = model_to_dict(package)
