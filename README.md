@@ -1,19 +1,29 @@
 # OSINT Assistant
 
-An AI-enhanced OSINT (Open Source Intelligence) tool for gathering, analyzing, and reporting on information from public sources. The assistant now supports **multi-LLM routing** and optional **AIA governed verification / signal ingest** instead of being locked to Perplexity only.
+Local-first OSINT assistant for gathering, analyzing, and reporting on public-source intelligence. This version is configured for **local LLM + local AIA only** — no Perplexity, OpenAI, Anthropic, or other external model providers by default.
 
-## Features
+## Local architecture
 
-- 🔍 **OSINT search:** collect candidate public sources for a query
-- 🧠 **Multi-LLM analysis:** route across Perplexity, OpenAI, Anthropic, Google, Groq, Mistral, xAI, DeepSeek, OpenRouter, Together, Fireworks, Cohere, or local OpenAI-compatible models
-- 🛡️ **AIA integration:** optionally call AIA `/verify` and ingest collected sources into AIA `/signals/ingest`
-- 📊 **Entity and relationship extraction:** identify key entities, sentiment, credibility, and connections
-- 📝 **Structured reports:** export Pydantic-backed JSON including provider status and AIA receipt
-- 🌐 **CLI + Flask web app:** use the terminal or the local web interface
+```text
+OSINT Assistant
+  -> local OpenAI-compatible LLM endpoint
+  -> local AIA /verify and /signals/ingest
+  -> JSON report with local provider status + AIA receipt
+```
+
+Default local endpoints:
+
+```env
+LOCAL_BASE_URL=http://localhost:11434/v1
+LOCAL_MODEL=llama3.1
+AIA_BASE_URL=http://localhost:3001
+```
+
+The local LLM endpoint can be Ollama, LM Studio, vLLM, llama.cpp server, or any local OpenAI-compatible `/chat/completions` server.
 
 ## Important evidence rule
 
-LLM output is **analysis**, not proof. AIA verification/signal capture makes OSINT runs governable inside the OrPaynter stack, but it does not automatically make a model output true, production-ready, or field-validated.
+Local model output is **analysis**, not proof. AIA verification/signal capture makes OSINT runs governable inside the OrPaynter stack, but it does not automatically make model output true, production-ready, or field-validated.
 
 ## Installation
 
@@ -24,51 +34,41 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-Fill only the provider keys you actually use. Never commit `.env`.
+Start local model server first. Example with Ollama:
 
-## Configuration
-
-Provider routing is controlled by `OSINT_LLM_PROVIDERS`:
-
-```env
-OSINT_LLM_PROVIDERS=perplexity,openai,anthropic,local
-PERPLEXITY_API_KEY=...
-OPENAI_API_KEY=...
-ANTHROPIC_API_KEY=...
-LOCAL_BASE_URL=http://localhost:11434/v1
-LOCAL_MODEL=llama3.1
-AIA_BASE_URL=http://localhost:3001
+```bash
+ollama serve
+ollama pull llama3.1
 ```
 
-Supported provider names:
+Start local AIA separately, typically:
 
-```text
-perplexity, openai, anthropic, google, groq, mistral, xai, deepseek,
-openrouter, together, fireworks, cohere, local
+```bash
+cd /path/to/AIA
+uvicorn agsi.api.main:app --port 3001
 ```
-
-Providers are tried in order. Missing keys are skipped. Provider errors fail over to the next configured provider and are recorded in `provider_runs`.
 
 ## CLI usage
 
-List providers:
+List providers. It should only return `local`:
 
 ```bash
 python osint_assistant.py --list-providers
 ```
 
-Run with `.env` configuration:
+Run local OSINT:
 
 ```bash
 python osint_assistant.py --query "roofing claims AI governance" --results 10
 ```
 
-Override providers and connect AIA for a run:
+Override local model or endpoint:
 
 ```bash
 python osint_assistant.py \
   --query "roofing claims AI governance" \
-  --providers perplexity,openai,anthropic,local \
+  --model llama3.1 \
+  --llm-base-url http://localhost:11434/v1 \
   --aia-base-url http://localhost:3001 \
   --json
 ```
@@ -95,17 +95,16 @@ bash run.sh
 run_windows.bat
 ```
 
-The Flask API uses `.env` by default. `/api/search` accepts optional fields:
+The Flask API uses `.env` by default. `/api/search` accepts optional local fields:
 
 ```json
 {
   "query": "roofing claims AI governance",
   "num_results": 10,
-  "providers": "perplexity,openai,anthropic",
-  "model": "sonar-pro",
-  "llm_base_url": "https://api.perplexity.ai",
+  "model": "llama3.1",
+  "llm_base_url": "http://localhost:11434/v1",
   "aia_base_url": "http://localhost:3001",
-  "aia_api_key": "optional-bearer-token",
+  "aia_api_key": "optional-local-token",
   "skip_aia": false
 }
 ```
@@ -114,39 +113,24 @@ The Flask API uses `.env` by default. `/api/search` accepts optional fields:
 
 When `AIA_BASE_URL` is set, the assistant:
 
-1. Calls `POST /verify` with a bounded statement summarizing the OSINT run.
+1. Calls `POST /verify` with a bounded statement summarizing the local OSINT run.
 2. Calls `POST /signals/ingest` with one signal per collected source.
 3. Records the result in `aia_receipt`.
 
-If AIA is unavailable, the OSINT run still completes and the integration error is recorded.
+If local AIA is unavailable, the OSINT run still completes and the integration error is recorded.
 
 ## Security notes
 
-- Never commit real provider keys, AIA tokens, or `.env`.
-- Treat all LLM outputs as untrusted analysis until sources are independently verified.
-- Do not send restricted or secret-bearing context to a provider unless that provider is approved for the data class.
+- No cloud model providers are configured by default.
+- Keep local API tokens and `.env` out of Git.
+- Treat all local LLM outputs as untrusted analysis until sources are independently verified.
 - Review logs and exported reports before sharing.
 
-## Development
-
-Python setup:
-
-```bash
-python -m venv .venv
-.venv\Scripts\activate  # Windows
-pip install -r requirements.txt
-```
-
-CLI smoke:
+## Development smoke checks
 
 ```bash
 python osint_assistant.py --list-providers
 python osint_assistant.py --query "quantum computing" --json --skip-aia
-```
-
-Frontend/web smoke:
-
-```bash
 python osint_web_app.py
 ```
 

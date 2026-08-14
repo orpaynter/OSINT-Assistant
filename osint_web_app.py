@@ -1,7 +1,7 @@
 from datetime import datetime
 from typing import Any, Dict
 
-from flask import Flask, jsonify, redirect, render_template_string, request
+from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
 
 from osint_assistant import OSINTAssistant, model_dump, split_csv
@@ -15,15 +15,15 @@ APP_HTML = """
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>OSINT Assistant</title>
+  <title>Local OSINT Assistant</title>
   <script src="https://cdn.tailwindcss.com"></script>
 </head>
 <body class="min-h-screen bg-neutral-950 text-neutral-100">
   <main class="mx-auto max-w-5xl p-6">
     <section class="rounded-2xl border border-orange-500/30 bg-neutral-900 p-6 shadow-2xl">
-      <p class="text-sm uppercase tracking-[0.3em] text-orange-400">OrPaynter OSINT</p>
-      <h1 class="mt-2 text-4xl font-black">AIA + Multi-LLM Intelligence Search</h1>
-      <p class="mt-3 text-neutral-300">Routes through configured LLM providers, then optionally verifies and captures signals in AIA.</p>
+      <p class="text-sm uppercase tracking-[0.3em] text-orange-400">OrPaynter Local OSINT</p>
+      <h1 class="mt-2 text-4xl font-black">Local LLM + Local AIA Intelligence Search</h1>
+      <p class="mt-3 text-neutral-300">No external model providers by default. Uses a local OpenAI-compatible endpoint and local AIA.</p>
       <form class="mt-6 grid gap-4" method="post" action="/search">
         <label class="grid gap-2">
           <span class="text-sm font-semibold">Search query</span>
@@ -31,16 +31,16 @@ APP_HTML = """
         </label>
         <div class="grid gap-4 md:grid-cols-2">
           <label class="grid gap-2">
-            <span class="text-sm font-semibold">Providers</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="providers" placeholder="perplexity,openai,anthropic,local">
+            <span class="text-sm font-semibold">Local model</span>
+            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="model" placeholder="llama3.1">
           </label>
           <label class="grid gap-2">
-            <span class="text-sm font-semibold">Model override</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="model" placeholder="optional">
+            <span class="text-sm font-semibold">Local LLM base URL</span>
+            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="llm_base_url" placeholder="http://localhost:11434/v1">
           </label>
           <label class="grid gap-2">
-            <span class="text-sm font-semibold">First-provider API key</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="api_key" type="password" placeholder="optional; env fallback preferred">
+            <span class="text-sm font-semibold">Local endpoint API key</span>
+            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="api_key" type="password" placeholder="optional">
           </label>
           <label class="grid gap-2">
             <span class="text-sm font-semibold">AIA base URL</span>
@@ -55,7 +55,7 @@ APP_HTML = """
             <span class="text-sm">Skip AIA for this run</span>
           </label>
         </div>
-        <button class="rounded-xl bg-orange-500 px-5 py-3 font-black text-black hover:bg-orange-400" type="submit">Run OSINT</button>
+        <button class="rounded-xl bg-orange-500 px-5 py-3 font-black text-black hover:bg-orange-400" type="submit">Run local OSINT</button>
       </form>
     </section>
 
@@ -65,7 +65,7 @@ APP_HTML = """
 
     {% if report %}
       <section class="mt-6 rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
-        <h2 class="text-2xl font-black">Run result</h2>
+        <h2 class="text-2xl font-black">Local run result</h2>
         <p class="mt-2 text-neutral-300">Found {{ report.query_info.results_found }} results.</p>
         {% if report.aia_receipt %}
           <p class="mt-2 text-sm text-orange-300">AIA: {{ 'enabled' if report.aia_receipt.enabled else 'disabled' }}{% if report.aia_receipt.error %} — {{ report.aia_receipt.error }}{% endif %}</p>
@@ -93,7 +93,7 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         raise ValueError("No query provided")
     assistant = OSINTAssistant(
         api_key=payload.get("api_key") or None,
-        providers=split_csv(payload.get("providers")),
+        providers=split_csv(payload.get("providers")) or ["local"],
         model=payload.get("model") or None,
         llm_base_url=payload.get("llm_base_url") or None,
         aia_base_url=payload.get("aia_base_url") or None,
@@ -131,11 +131,6 @@ def api_search():
         return jsonify({"error": str(exc)}), 400
     except Exception as exc:  # noqa: BLE001
         return jsonify({"error": str(exc)}), 500
-
-
-@app.route("/results/<session_id>")
-def legacy_results(session_id: str):
-    return redirect("/")
 
 
 if __name__ == "__main__":
