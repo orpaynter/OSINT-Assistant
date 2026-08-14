@@ -1,29 +1,31 @@
 # OSINT Assistant
 
-Local-first OSINT assistant for gathering, analyzing, and reporting on public-source intelligence. This version is configured for **local LLM + local AIA only** — no Perplexity, OpenAI, Anthropic, or other external model providers by default.
+Local-first OSINT assistant for public-source research. This version uses a **local LLM**, connects to the **internet**, supports **Tor/.onion dark-web source access**, and can send governed verification/signal receipts to **local AIA**.
 
 ## Local architecture
 
 ```text
 OSINT Assistant
+  -> clearnet fetch / optional local SearXNG search
+  -> Tor SOCKS proxy for .onion URLs
   -> local OpenAI-compatible LLM endpoint
   -> local AIA /verify and /signals/ingest
-  -> JSON report with local provider status + AIA receipt
+  -> JSON report with source fetches + provider status + AIA receipt
 ```
 
-Default local endpoints:
+Defaults:
 
 ```env
 LOCAL_BASE_URL=http://localhost:11434/v1
 LOCAL_MODEL=llama3.1
+SEARXNG_URL=http://localhost:8080
+TOR_PROXY=socks5h://127.0.0.1:9050
 AIA_BASE_URL=http://localhost:3001
 ```
 
-The local LLM endpoint can be Ollama, LM Studio, vLLM, llama.cpp server, or any local OpenAI-compatible `/chat/completions` server.
+## Evidence and safety rule
 
-## Important evidence rule
-
-Local model output is **analysis**, not proof. AIA verification/signal capture makes OSINT runs governable inside the OrPaynter stack, but it does not automatically make model output true, production-ready, or field-validated.
+Local model output is **analysis**, not proof. Internet or .onion access is for authorized public-source research only. Do not use this tool to buy, sell, access stolen data, bypass authentication, exploit systems, or facilitate illegal activity. AIA capture makes runs governable; it does not make unverified sources true.
 
 ## Installation
 
@@ -41,11 +43,25 @@ ollama serve
 ollama pull llama3.1
 ```
 
-Start local AIA separately, typically:
+Start local AIA separately:
 
 ```bash
 cd /path/to/AIA
 uvicorn agsi.api.main:app --port 3001
+```
+
+Optional: start local SearXNG for clearnet search:
+
+```bash
+docker run --rm -p 8080:8080 searxng/searxng
+```
+
+Optional: start Tor for .onion access:
+
+```bash
+# Linux/macOS example
+ tor
+# Windows: run Tor Browser or Tor Expert Bundle and expose SOCKS on 127.0.0.1:9050
 ```
 
 ## CLI usage
@@ -56,13 +72,25 @@ List providers. It should only return `local`:
 python osint_assistant.py --list-providers
 ```
 
-Run local OSINT:
+Run local OSINT against a topic:
 
 ```bash
 python osint_assistant.py --query "roofing claims AI governance" --results 10
 ```
 
-Override local model or endpoint:
+Fetch/analyze a direct internet URL:
+
+```bash
+python osint_assistant.py --query "https://example.com/report" --json
+```
+
+Fetch/analyze a direct .onion URL through Tor:
+
+```bash
+python osint_assistant.py --query "http://exampleonionaddress.onion/path" --json
+```
+
+Override local endpoints:
 
 ```bash
 python osint_assistant.py \
@@ -77,12 +105,6 @@ Disable AIA for a run:
 
 ```bash
 python osint_assistant.py --query "example" --skip-aia
-```
-
-Save output:
-
-```bash
-python osint_assistant.py --query "example" --save
 ```
 
 ## Web application
@@ -103,8 +125,10 @@ The Flask API uses `.env` by default. `/api/search` accepts optional local field
   "num_results": 10,
   "model": "llama3.1",
   "llm_base_url": "http://localhost:11434/v1",
+  "searxng_url": "http://localhost:8080",
+  "tor_proxy": "socks5h://127.0.0.1:9050",
+  "allow_onion": true,
   "aia_base_url": "http://localhost:3001",
-  "aia_api_key": "optional-local-token",
   "skip_aia": false
 }
 ```
@@ -121,16 +145,17 @@ If local AIA is unavailable, the OSINT run still completes and the integration e
 
 ## Security notes
 
-- No cloud model providers are configured by default.
+- No cloud model providers are configured.
+- Tor/.onion support requires a local Tor proxy; it is not bundled.
 - Keep local API tokens and `.env` out of Git.
-- Treat all local LLM outputs as untrusted analysis until sources are independently verified.
+- Treat all local LLM outputs and fetched source text as untrusted until independently verified.
 - Review logs and exported reports before sharing.
 
 ## Development smoke checks
 
 ```bash
 python osint_assistant.py --list-providers
-python osint_assistant.py --query "quantum computing" --json --skip-aia
+python osint_assistant.py --query "https://example.com" --json --skip-aia
 python osint_web_app.py
 ```
 

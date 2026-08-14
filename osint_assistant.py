@@ -6,9 +6,10 @@ import re
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
-from urllib.parse import urlparse
+from urllib.parse import quote_plus, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field
 from rich.console import Console
@@ -18,8 +19,8 @@ load_dotenv()
 
 DEFAULT_SYSTEM_PROMPT = """
 You are a local OSINT (Open Source Intelligence) research assistant.
-Gather factual information from reliable public sources, cite sources where
-possible, separate facts from inference, and do not invent proof.
+Use only authorized, public-source research. Separate facts from inference,
+cite sources where possible, and do not invent proof.
 """
 
 
@@ -55,11 +56,22 @@ class AIAReceipt(BaseModel):
     error: Optional[str] = None
 
 
+class SourceFetch(BaseModel):
+    url: str
+    status: str
+    http_status: Optional[int] = None
+    title: Optional[str] = None
+    text_excerpt: Optional[str] = None
+    error: Optional[str] = None
+    via_tor: bool = False
+
+
 class OSINTReport(BaseModel):
     collected_data: List[SearchResult]
     analysis_results: Dict[str, Any]
     timestamp: str
     query_info: Dict[str, Any]
+    source_fetches: List[SourceFetch] = Field(default_factory=list)
     provider_runs: List[ProviderRun] = Field(default_factory=list)
     aia_receipt: Optional[AIAReceipt] = None
 
@@ -82,6 +94,11 @@ def split_csv(value: Optional[str]) -> List[str]:
     return [item.strip() for item in value.split(",") if item.strip()]
 
 
+def is_url(value: str) -> bool:
+    parsed = urlparse(value)
+    return parsed.scheme in {"http", "https"} and bool(parsed.netloc)
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     name: str
@@ -90,13 +107,7 @@ class ProviderConfig:
     default_model: str
 
 
-LOCAL_PROVIDER = ProviderConfig(
-    name="local",
-    api_key_env="LOCAL_LLM_API_KEY",
-    base_url="http://localhost:11434/v1",
-    default_model="llama3.1",
-)
-
+LOCAL_PROVIDER = ProviderConfig("local", "LOCAL_LLM_API_KEY", "http://localhost:11434/v1", "llama3.1")
 PROVIDERS: Dict[str, ProviderConfig] = {"local": LOCAL_PROVIDER}
 
 
@@ -130,10 +141,9 @@ class ApiClient:
         max_tokens: int = 2000,
     ) -> Optional[str]:
         self.provider_runs = []
-        config = LOCAL_PROVIDER
-        selected_model = model or self.model_override or config.default_model
-        base_url = self.base_url_override or config.base_url
-        api_key = self.api_key_override or os.getenv(config.api_key_env) or "local-dev-key"
+        selected_model = model or self.model_override or LOCAL_PROVIDER.default_model
+        base_url = self.base_url_override or LOCAL_PROVIDER.base_url
+        api_key = self.api_key_override or os.getenv(LOCAL_PROVIDER.api_key_env) or "local-dev-key"
         try:
             content = self._call_openai_compatible(api_key, base_url, messages, selected_model, temperature, max_tokens)
             self.provider_runs.append(ProviderRun(provider="local", model=selected_model, status="ok"))
@@ -164,6 +174,94 @@ class ApiClient:
         response.raise_for_status()
         payload = response.json()
         return payload["choices"][0]["message"]["content"]
+
+
+class SourceClient:
+    """Clearnet + Tor source fetcher for local OSINT."""
+
+    def __init__(
+        self,
+        internet_enabled: Optional[bool] = None,
+        allow_onion: Optional[bool] = None,
+        tor_proxy: Optional[str] = None,
+        searxng_url: Optional[str] = None,
+    ):
+        self.internet_enabled = internet_enabled if internet_enabled is not None else os.getenv("INTERNET_ENABLED", "true").lower() == "true"
+        self.allow_onion = allow_onion if allow_onion is not None else os.getenv("ALLOW_ONION", "true").lower() == "true"
+        self.tor_proxy = tor_proxy or os.getenv("TOR_PROXY", "socks5h://127.0.0.1:9050")
+        self.searxng_url = (searxng_url or os.getenv("SEARXNG_URL") or "").rstrip("/")
+        self.user_agent = os.getenv("OSINT_USER_AGENT", "OSINT-Assistant/1.0 (+authorized research)")
+
+    def proxies_for(self, url: str) -> Optional[Dict[str, str]]:
+        host = urlparse(url).hostname or ""
+        if host.endswith(".onion"):
+            if not self.allow_onion:
+                raise ValueError(".onion access is disabled. Set ALLOW_ONION=true to enable.")
+            return {"http": self.tor_proxy, "https": self.tor_proxy}
+        return None
+
+    def fetch_url(self, url: str, timeout: int = 45) -> SourceFetch:
+        if not self.internet_enabled:
+            return SourceFetch(url=url, status="disabled", error="Internet access disabled")
+        try:
+            proxies = self.proxies_for(url)
+            response = requests.get(
+                url,
+                headers={"User-Agent": self.user_agent},
+                proxies=proxies,
+                timeout=timeout,
+            )
+            response.raise_for_status()
+            title, excerpt = self.extract_text(response.text)
+            return SourceFetch(
+                url=url,
+                status="ok",
+                http_status=response.status_code,
+                title=title,
+                text_excerpt=excerpt,
+                via_tor=bool(proxies),
+            )
+        except Exception as exc:  # noqa: BLE001
+            return SourceFetch(url=url, status="error", error=str(exc), via_tor=(urlparse(url).hostname or "").endswith(".onion"))
+
+    def search(self, query: str, limit: int = 10) -> List[SearchResult]:
+        if not self.internet_enabled or not self.searxng_url:
+            return []
+        try:
+            response = requests.get(
+                f"{self.searxng_url}/search",
+                params={"q": query, "format": "json"},
+                headers={"User-Agent": self.user_agent},
+                timeout=45,
+            )
+            response.raise_for_status()
+            payload = response.json()
+        except Exception:
+            return []
+        results = []
+        for item in payload.get("results", [])[:limit]:
+            url = item.get("url")
+            if not url:
+                continue
+            results.append(
+                SearchResult(
+                    title=item.get("title") or "Untitled result",
+                    url=url,
+                    snippet=item.get("content") or item.get("snippet") or "",
+                    source_type="SearXNG",
+                    timestamp=datetime.now().strftime("%Y-%m-%d"),
+                )
+            )
+        return results
+
+    @staticmethod
+    def extract_text(html: str) -> tuple[str, str]:
+        soup = BeautifulSoup(html, "html.parser")
+        for tag in soup(["script", "style", "noscript"]):
+            tag.decompose()
+        title = soup.title.string.strip() if soup.title and soup.title.string else "Untitled source"
+        text = " ".join(soup.get_text(" ").split())
+        return title[:300], text[:2500]
 
 
 class AIAClient:
@@ -253,12 +351,15 @@ class OSINTAssistant:
         aia_base_url: Optional[str] = None,
         aia_api_key: Optional[str] = None,
         enable_aia: bool = True,
+        source_client: Optional[SourceClient] = None,
     ):
         self.console = Console()
         self.api_client = ApiClient(api_key=api_key, providers=providers, model=model, base_url=llm_base_url)
+        self.source_client = source_client or SourceClient()
         self.aia_client = AIAClient(aia_base_url, aia_api_key) if enable_aia else None
         self.collected_data: List[Dict[str, Any]] = []
         self.analysis_results: Dict[str, Dict[str, Any]] = {}
+        self.source_fetches: List[SourceFetch] = []
         self.provider_runs: List[ProviderRun] = []
         self.aia_receipt: Optional[AIAReceipt] = None
 
@@ -269,21 +370,28 @@ class OSINTAssistant:
         return response
 
     def search_web(self, query: str, num_results: int = 10) -> List[SearchResult]:
-        self.console.print(f"[bold blue]Searching locally for:[/bold blue] {query}")
-        results = self._perform_search(query, num_results)
+        self.console.print(f"[bold blue]Searching locally with internet/Tor enabled for:[/bold blue] {query}")
+        if is_url(query):
+            fetch = self.source_client.fetch_url(query)
+            self.source_fetches.append(fetch)
+            results = [self.result_from_fetch(fetch)]
+        else:
+            results = self.source_client.search(query, num_results)
+            if not results:
+                results = self._perform_local_candidate_search(query, num_results)
         self.collected_data = [model_dump(result) for result in results[:num_results]]
         self._send_to_aia(query)
         self.console.print(f"[green]Found {len(self.collected_data)} results[/green]")
         return results
 
-    def _perform_search(self, query: str, num_results: int) -> List[SearchResult]:
+    def _perform_local_candidate_search(self, query: str, num_results: int) -> List[SearchResult]:
         system_prompt = f"""
-Return ONLY a valid JSON array with up to {num_results} OSINT search results.
+Return ONLY a valid JSON array with up to {num_results} OSINT source candidates.
 Each object must include: title, url, snippet, source_type, timestamp.
-Prefer primary sources. Do not invent URLs. If live web access is unavailable,
-return clearly labeled candidate sources or say what must be searched manually.
+Prefer primary clearnet or .onion sources when known. Do not invent URLs; if a URL
+is unknown, use https://example.invalid/source-needed and say source lookup is required.
 """
-        content = self.ask_ai(f"Find OSINT sources for: {query}", system_prompt, max_tokens=4000)
+        content = self.ask_ai(f"Find OSINT source candidates for: {query}", system_prompt, max_tokens=4000)
         parsed = JsonHelper.extract_json_from_text(content or "", self.console) if content else []
         if not isinstance(parsed, list):
             parsed = []
@@ -292,7 +400,7 @@ return clearly labeled candidate sources or say what must be searched manually.
             if not isinstance(item, dict):
                 continue
             item.setdefault("title", "Untitled result")
-            item.setdefault("url", "https://example.invalid/local-model-candidate")
+            item.setdefault("url", "https://example.invalid/source-needed")
             item.setdefault("snippet", "")
             item.setdefault("source_type", "Local model candidate")
             item.setdefault("timestamp", datetime.now().strftime("%Y-%m-%d"))
@@ -304,14 +412,28 @@ return clearly labeled candidate sources or say what must be searched manually.
             return results
         return [SearchResult(**item) for item in self._generate_local_placeholders(query, num_results)]
 
+    @staticmethod
+    def result_from_fetch(fetch: SourceFetch) -> SearchResult:
+        return SearchResult(
+            title=fetch.title or f"Fetched source: {fetch.url}",
+            url=fetch.url,
+            snippet=fetch.text_excerpt or fetch.error or "",
+            source_type="Tor/.onion" if fetch.via_tor else "Internet URL",
+            timestamp=datetime.now().strftime("%Y-%m-%d"),
+        )
+
     def analyze_content(self, url: str) -> Optional[ContentAnalysis]:
-        self.console.print(f"[bold blue]Analyzing locally:[/bold blue] {url}")
+        self.console.print(f"[bold blue]Analyzing source:[/bold blue] {url}")
+        fetch = self.source_client.fetch_url(url) if is_url(url) else None
+        if fetch:
+            self.source_fetches.append(fetch)
+        source_text = fetch.text_excerpt if fetch and fetch.text_excerpt else ""
         system_prompt = """
 Return ONLY JSON with: domain, credibility_score, key_entities, sentiment,
 timestamps {published,last_updated}, and connections [{from,to,relationship}].
-Use UNKNOWN/N/A where the local model cannot verify source contents.
+Use UNKNOWN/N/A where the source does not support a claim.
 """
-        content = self.ask_ai(f"Analyze this OSINT source: {url}", system_prompt)
+        content = self.ask_ai(f"Analyze this OSINT source URL: {url}\n\nSource excerpt:\n{source_text[:2500]}", system_prompt)
         parsed = JsonHelper.extract_json_from_text(content or "", self.console) if content else None
         analysis = parsed if isinstance(parsed, dict) else self._generate_local_analysis(url, urlparse(url).netloc)
         normalized = self._normalize_analysis(analysis, url)
@@ -328,12 +450,7 @@ Use UNKNOWN/N/A where the local model cannot verify source contents.
                 f"Local OSINT Assistant collected {len(self.collected_data)} candidate sources for query: {query}"[:4000]
             )
             inserted = self.aia_client.ingest_results(query, self.collected_data)
-            self.aia_receipt = AIAReceipt(
-                enabled=True,
-                base_url=self.aia_client.base_url,
-                verification=verification,
-                signals_ingested=inserted,
-            )
+            self.aia_receipt = AIAReceipt(True, self.aia_client.base_url, verification, inserted)
         except Exception as exc:  # noqa: BLE001
             self.aia_receipt = AIAReceipt(enabled=True, base_url=self.aia_client.base_url, error=str(exc))
             self.console.print(f"[yellow]Local AIA integration failed: {exc}[/yellow]")
@@ -343,7 +460,8 @@ Use UNKNOWN/N/A where the local model cannot verify source contents.
             collected_data=[SearchResult(**item) for item in self.collected_data],
             analysis_results=self.analysis_results,
             timestamp=datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-            query_info={"query": query, "results_requested": results_requested, "results_found": len(self.collected_data), "mode": "local-only"},
+            query_info={"query": query, "results_requested": results_requested, "results_found": len(self.collected_data), "mode": "local-llm-internet-tor"},
+            source_fetches=self.source_fetches,
             provider_runs=self.provider_runs,
             aia_receipt=self.aia_receipt,
         )
@@ -358,10 +476,14 @@ Use UNKNOWN/N/A where the local model cannot verify source contents.
             domain = urlparse(item["url"]).netloc
             table.add_row(domain, item["source_type"], f"{self._calculate_credibility(domain):.2f}")
         self.console.print(table)
-        self.console.print("\n[bold blue]Local / AIA Status:[/bold blue]")
+        self.console.print("\n[bold blue]Local / Internet / Tor / AIA Status:[/bold blue]")
         for run in self.provider_runs[-12:]:
             detail = f" — {run.error}" if run.error else ""
             self.console.print(f"- {run.provider}:{run.model} — {run.status.upper()}{detail}")
+        for fetch in self.source_fetches[-12:]:
+            detail = f" — {fetch.error}" if fetch.error else ""
+            route = "Tor" if fetch.via_tor else "Internet"
+            self.console.print(f"- {route} fetch {fetch.url} — {fetch.status.upper()}{detail}")
         if self.aia_receipt:
             if self.aia_receipt.enabled and not self.aia_receipt.error:
                 self.console.print(f"- AIA — OK; signals ingested: {self.aia_receipt.signals_ingested}")
@@ -390,17 +512,16 @@ Use UNKNOWN/N/A where the local model cannot verify source contents.
             "credibility_score": score,
             "key_entities": [str(entity) for entity in entities],
             "sentiment": sentiment,
-            "timestamps": {
-                "published": str(timestamps.get("published", "N/A")),
-                "last_updated": str(timestamps.get("last_updated", "N/A")),
-            },
-            "connections": [conn for conn in connections if isinstance(conn, dict)]
-            or [{"from": "UNKNOWN", "to": "UNKNOWN", "relationship": "local model could not verify"}],
+            "timestamps": {"published": str(timestamps.get("published", "N/A")), "last_updated": str(timestamps.get("last_updated", "N/A"))},
+            "connections": [conn for conn in connections if isinstance(conn, dict)] or [{"from": "UNKNOWN", "to": "UNKNOWN", "relationship": "source did not verify"}],
         }
 
     def _calculate_credibility(self, domain: str) -> float:
-        credibility_db = {"example.com": 0.6, "dataresearch.org": 0.8, "gov.reports.org": 0.9}
-        return credibility_db.get(domain, 0.5)
+        if domain.endswith(".gov") or domain.endswith(".edu"):
+            return 0.8
+        if domain.endswith(".onion"):
+            return 0.35
+        return 0.5
 
     def _generate_local_analysis(self, url: str, domain: str) -> Dict[str, Any]:
         return {
@@ -409,27 +530,26 @@ Use UNKNOWN/N/A where the local model cannot verify source contents.
             "key_entities": ["UNKNOWN"],
             "sentiment": "neutral",
             "timestamps": {"published": "N/A", "last_updated": datetime.now().strftime("%Y-%m-%d")},
-            "connections": [{"from": "UNKNOWN", "to": "UNKNOWN", "relationship": "local model could not verify"}],
+            "connections": [{"from": "UNKNOWN", "to": "UNKNOWN", "relationship": "source did not verify"}],
         }
 
     def _generate_local_placeholders(self, query: str, count: int) -> List[Dict[str, str]]:
-        results = []
-        for index in range(count):
-            results.append(
-                {
-                    "title": f"Local OSINT candidate for {query}: {index + 1}",
-                    "url": "https://example.invalid/local-only-needs-source-search",
-                    "snippet": "Local-only mode did not return a verifiable source. Run with a local model that has retrieval/tool access or manually add sources.",
-                    "source_type": "Local-only placeholder",
-                    "timestamp": datetime.now().strftime("%Y-%m-%d"),
-                }
-            )
-        return results
+        encoded = quote_plus(query)
+        return [
+            {
+                "title": f"Source lookup required for {query}",
+                "url": f"https://example.invalid/source-needed?q={encoded}&n={index + 1}",
+                "snippet": "Configure SEARXNG_URL for clearnet search, provide a direct URL, or provide a .onion URL with Tor running on TOR_PROXY.",
+                "source_type": "Source lookup required",
+                "timestamp": datetime.now().strftime("%Y-%m-%d"),
+            }
+            for index in range(count)
+        ]
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Local-only OSINT Assistant with local AIA integration")
-    parser.add_argument("--query", "-q", type=str, help="The search query to investigate")
+    parser = argparse.ArgumentParser(description="Local OSINT Assistant with internet/Tor source access and local AIA integration")
+    parser.add_argument("--query", "-q", type=str, help="Search query or direct http(s)/.onion URL")
     parser.add_argument("--results", "-r", type=int, default=10, help="Number of results to collect")
     parser.add_argument("--save", "-s", action="store_true", help="Save collected data to JSON")
     parser.add_argument("--api-key", "-k", type=str, help="Optional local endpoint API key")
@@ -446,6 +566,9 @@ def main() -> None:
     if args.list_providers:
         print("local")
         return
+    if not args.query:
+        print("Please provide a search query or URL using --query or -q")
+        return
 
     assistant = OSINTAssistant(
         api_key=args.api_key,
@@ -456,10 +579,6 @@ def main() -> None:
         aia_api_key=args.aia_api_key,
         enable_aia=not args.skip_aia,
     )
-    if not args.query:
-        print("Please provide a search query using --query or -q")
-        return
-
     assistant.search_web(args.query, args.results)
     for item in assistant.collected_data:
         assistant.analyze_content(item["url"])

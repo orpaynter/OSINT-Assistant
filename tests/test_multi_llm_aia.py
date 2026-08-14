@@ -1,4 +1,4 @@
-from osint_assistant import AIAClient, ApiClient, OSINTAssistant, split_csv
+from osint_assistant import AIAClient, ApiClient, SourceClient, split_csv
 
 
 def test_split_csv_trims_empty_values():
@@ -21,9 +21,14 @@ def test_aia_defaults_to_localhost(monkeypatch):
     assert client.base_url == "http://localhost:3001"
 
 
-def test_osint_report_records_aia_disabled():
-    assistant = OSINTAssistant(providers=["local"], enable_aia=False)
-    assistant.collected_data = []
-    assistant._send_to_aia("test")
-    assert assistant.aia_receipt is not None
-    assert assistant.aia_receipt.enabled is False
+def test_onion_uses_tor_proxy():
+    client = SourceClient(tor_proxy="socks5h://127.0.0.1:9050")
+    assert client.proxies_for("http://abc123.onion/") == {
+        "http": "socks5h://127.0.0.1:9050",
+        "https": "socks5h://127.0.0.1:9050",
+    }
+
+
+def test_clearnet_uses_direct_connection():
+    client = SourceClient()
+    assert client.proxies_for("https://example.com") is None

@@ -4,7 +4,7 @@ from typing import Any, Dict
 from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
 
-from osint_assistant import OSINTAssistant, model_dump, split_csv
+from osint_assistant import OSINTAssistant, SourceClient, model_dump, split_csv
 
 app = Flask(__name__)
 CORS(app)
@@ -22,54 +22,34 @@ APP_HTML = """
   <main class="mx-auto max-w-5xl p-6">
     <section class="rounded-2xl border border-orange-500/30 bg-neutral-900 p-6 shadow-2xl">
       <p class="text-sm uppercase tracking-[0.3em] text-orange-400">OrPaynter Local OSINT</p>
-      <h1 class="mt-2 text-4xl font-black">Local LLM + Local AIA Intelligence Search</h1>
-      <p class="mt-3 text-neutral-300">No external model providers by default. Uses a local OpenAI-compatible endpoint and local AIA.</p>
+      <h1 class="mt-2 text-4xl font-black">Local LLM + Internet/Tor + Local AIA</h1>
+      <p class="mt-3 text-neutral-300">Uses local models, clearnet source fetch/search, optional Tor/.onion access, and local AIA.</p>
       <form class="mt-6 grid gap-4" method="post" action="/search">
         <label class="grid gap-2">
-          <span class="text-sm font-semibold">Search query</span>
-          <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="query" required value="{{ query or '' }}">
+          <span class="text-sm font-semibold">Search query or direct URL</span>
+          <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="query" required value="{{ query or '' }}" placeholder="topic, https://..., or http://example.onion/...">
         </label>
         <div class="grid gap-4 md:grid-cols-2">
-          <label class="grid gap-2">
-            <span class="text-sm font-semibold">Local model</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="model" placeholder="llama3.1">
-          </label>
-          <label class="grid gap-2">
-            <span class="text-sm font-semibold">Local LLM base URL</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="llm_base_url" placeholder="http://localhost:11434/v1">
-          </label>
-          <label class="grid gap-2">
-            <span class="text-sm font-semibold">Local endpoint API key</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="api_key" type="password" placeholder="optional">
-          </label>
-          <label class="grid gap-2">
-            <span class="text-sm font-semibold">AIA base URL</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="aia_base_url" placeholder="http://localhost:3001">
-          </label>
-          <label class="grid gap-2">
-            <span class="text-sm font-semibold">Results</span>
-            <input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="num_results" type="number" min="1" max="50" value="10">
-          </label>
-          <label class="flex items-center gap-3 pt-7">
-            <input name="skip_aia" type="checkbox">
-            <span class="text-sm">Skip AIA for this run</span>
-          </label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">Local model</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="model" placeholder="llama3.1"></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">Local LLM base URL</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="llm_base_url" placeholder="http://localhost:11434/v1"></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">SearXNG URL</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="searxng_url" placeholder="http://localhost:8080"></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">Tor proxy</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="tor_proxy" placeholder="socks5h://127.0.0.1:9050"></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">AIA base URL</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="aia_base_url" placeholder="http://localhost:3001"></label>
+          <label class="grid gap-2"><span class="text-sm font-semibold">Results</span><input class="rounded-xl border border-neutral-700 bg-neutral-950 p-3" name="num_results" type="number" min="1" max="50" value="10"></label>
+          <label class="flex items-center gap-3"><input name="allow_onion" type="checkbox" checked><span class="text-sm">Allow .onion via Tor</span></label>
+          <label class="flex items-center gap-3"><input name="skip_aia" type="checkbox"><span class="text-sm">Skip AIA for this run</span></label>
         </div>
-        <button class="rounded-xl bg-orange-500 px-5 py-3 font-black text-black hover:bg-orange-400" type="submit">Run local OSINT</button>
+        <button class="rounded-xl bg-orange-500 px-5 py-3 font-black text-black hover:bg-orange-400" type="submit">Run OSINT</button>
       </form>
     </section>
 
-    {% if error %}
-      <section class="mt-6 rounded-xl border border-red-500 bg-red-950/50 p-4 text-red-200">{{ error }}</section>
-    {% endif %}
+    {% if error %}<section class="mt-6 rounded-xl border border-red-500 bg-red-950/50 p-4 text-red-200">{{ error }}</section>{% endif %}
 
     {% if report %}
       <section class="mt-6 rounded-2xl border border-neutral-800 bg-neutral-900 p-6">
-        <h2 class="text-2xl font-black">Local run result</h2>
+        <h2 class="text-2xl font-black">Run result</h2>
         <p class="mt-2 text-neutral-300">Found {{ report.query_info.results_found }} results.</p>
-        {% if report.aia_receipt %}
-          <p class="mt-2 text-sm text-orange-300">AIA: {{ 'enabled' if report.aia_receipt.enabled else 'disabled' }}{% if report.aia_receipt.error %} — {{ report.aia_receipt.error }}{% endif %}</p>
-        {% endif %}
+        {% if report.aia_receipt %}<p class="mt-2 text-sm text-orange-300">AIA: {{ 'enabled' if report.aia_receipt.enabled else 'disabled' }}{% if report.aia_receipt.error %} — {{ report.aia_receipt.error }}{% endif %}</p>{% endif %}
         <div class="mt-4 grid gap-3">
           {% for item in report.collected_data %}
             <article class="rounded-xl border border-neutral-800 bg-neutral-950 p-4">
@@ -91,6 +71,11 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     query = payload.get("query")
     if not query:
         raise ValueError("No query provided")
+    source_client = SourceClient(
+        allow_onion=payload.get("allow_onion", True) not in {False, "false", "False", "0", "off"},
+        tor_proxy=payload.get("tor_proxy") or None,
+        searxng_url=payload.get("searxng_url") or None,
+    )
     assistant = OSINTAssistant(
         api_key=payload.get("api_key") or None,
         providers=split_csv(payload.get("providers")) or ["local"],
@@ -99,6 +84,7 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         aia_base_url=payload.get("aia_base_url") or None,
         aia_api_key=payload.get("aia_api_key") or None,
         enable_aia=not bool(payload.get("skip_aia")),
+        source_client=source_client,
     )
     num_results = int(payload.get("num_results", 10))
     assistant.search_web(query, num_results)
@@ -116,6 +102,7 @@ def index():
 def search():
     payload = dict(request.form)
     payload["skip_aia"] = "skip_aia" in request.form
+    payload["allow_onion"] = "allow_onion" in request.form
     try:
         report = run_search(payload)
         return render_template_string(APP_HTML, query=payload.get("query"), report=report, error=None, current_year=datetime.now().year)
