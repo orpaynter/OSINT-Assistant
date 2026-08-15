@@ -2,7 +2,7 @@
 
 Organizations can no longer manually keep pace with the volume of public information tied to fraud, vendor risk, and threat exposure — that gap is real and growing. OSINT-Assistant is an open-source, evidence-governed framework built to address it: automated web search, entity and pattern analysis, and an auditable trail of how conclusions were reached, powered by Perplexity Sonar.
 
-This is an early-stage, actively developed project. It is not yet a proven, production-hardened solution — contributions, testing, and real-world pilots are what will get it there.
+This is an early-stage, actively developed project. It is not yet a proven, production-hardened solution - contributions, testing, and real-world pilots are what will get it there.
 
 This project includes both a command-line interface and a full-featured web application for easier interaction.
 
@@ -28,7 +28,7 @@ This project includes both a command-line interface and a full-featured web appl
 
 1. Clone the repository:
    ```bash
-   git clone https://github.com/AXRoux/OSINT-Assistant.git
+    git clone https://github.com/orpaynter/OSINT-Assistant.git
    cd OSINT-Assistant
    ```
 
