@@ -129,6 +129,7 @@ TOR_FETCH_OUTPUT = _tool_schema(
     capability_level="tor",
 )
 def tor_fetch(url: str, timeout: int = 20, max_bytes: int = 65535) -> Dict[str, Any]:
+    max_bytes = max(0, max_bytes)
     preview = f"Tor fetch placeholder for {url}; no network content was retrieved during this local mock invocation."
     return _tool_result(
         {

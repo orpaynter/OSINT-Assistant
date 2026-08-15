@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import importlib
 import importlib.metadata
+import importlib.util
 import inspect
 import pkgutil
 import sys
@@ -76,41 +77,46 @@ def _load_fastmcp_from_fastmcp_package() -> Optional[type]:
 
 
 def _load_fastmcp_from_external_mcp_sdk() -> Optional[type]:
+    """Try to import FastMCP from the installed ``mcp`` distribution.
+
+    Locates the source file directly from the distribution metadata and loads
+    it via ``importlib.util.spec_from_file_location`` so that neither
+    ``sys.path`` nor ``sys.modules`` is mutated.
+    """
     try:
         dist = importlib.metadata.distribution("mcp")
     except importlib.metadata.PackageNotFoundError:
         return None
 
-    repo_root = Path(__file__).resolve().parents[1]
-    dist_root = str(dist.locate_file(""))
-    original_sys_path = sys.path[:]
-    local_modules = {name: module for name, module in sys.modules.items() if name == "mcp" or name.startswith("mcp.")}
+    # Candidate relative paths within the distribution for FastMCP.
+    candidates = [
+        "mcp/server/fastmcp.py",
+        "mcp/server/fastmcp/__init__.py",
+    ]
+    for relative in candidates:
+        try:
+            file_path = dist.locate_file(relative)
+        except Exception:
+            continue
 
-    try:
-        filtered_path = []
-        for entry in original_sys_path:
-            try:
-                resolved = Path(entry or ".").resolve()
-            except Exception:
-                resolved = None
-            if resolved == repo_root:
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            continue
+
+        try:
+            spec = importlib.util.spec_from_file_location("_mcp_sdk_fastmcp", file_path)
+            if spec is None or spec.loader is None:
                 continue
-            filtered_path.append(entry)
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        except Exception:
+            continue
 
-        if dist_root not in filtered_path:
-            filtered_path.insert(0, dist_root)
+        cls = getattr(mod, "FastMCP", None)
+        if cls is not None:
+            return cls
 
-        for module_name in local_modules:
-            sys.modules.pop(module_name, None)
-        sys.path = filtered_path
-        module = importlib.import_module("mcp.server.fastmcp")
-        return getattr(module, "FastMCP", None)
-    except Exception:
-        return None
-    finally:
-        sys.path = original_sys_path
-        for module_name, module in local_modules.items():
-            sys.modules[module_name] = module
+    return None
 
 
 def _resolve_fastmcp_class() -> type:
