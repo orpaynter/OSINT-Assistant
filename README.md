@@ -28,7 +28,7 @@ This project includes both a command-line interface and a full-featured web appl
 
 1. Clone the repository:
    ```bash
-  git clone https://github.com/orpaynter/OSINT-Assistant.git
+    git clone https://github.com/orpaynter/OSINT-Assistant.git
    cd OSINT-Assistant
    ```
 
