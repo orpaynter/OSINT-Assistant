@@ -45,6 +45,14 @@ def main(argv: list[str] | None = None) -> int:
         for tool in tools:
             print(f"- {tool.get('name', '<unknown>')} [{tool.get('capability_level', 'unknown')}]", file=sys.stderr)
 
+    run_callable = getattr(server.server, "run", None)
+    if not callable(run_callable):
+        print(
+            "No runnable MCP backend available. Install fastmcp: pip install fastmcp",
+            file=sys.stderr,
+        )
+        return 1
+
     _run_server(server.server, transport=args.transport, host=args.host, port=args.port)
     return 0
 

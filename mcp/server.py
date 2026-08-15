@@ -11,16 +11,35 @@ from typing import Any, Callable, Dict, Iterable, Optional
 
 
 class _FallbackFastMCP:
+    """Minimal MCP server used when neither fastmcp nor the mcp SDK is installed.
+
+    It stores full tool metadata (including schemas) and provides a basic
+    ``run()`` so the CLI entrypoint does not silently become a no-op.  Install
+    the ``fastmcp`` package (``pip install fastmcp``) for full MCP protocol
+    support over stdio/SSE.
+    """
+
     def __init__(self, name: str):
         self.name = name
         self._tools: Dict[str, Dict[str, Any]] = {}
 
-    def tool(self, *, name: Optional[str] = None, description: Optional[str] = None):
+    def tool(
+        self,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        input_schema: Optional[Dict[str, Any]] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+        capability_level: Optional[str] = None,
+    ):
         def decorator(func: Callable[..., Any]):
             tool_name = name or func.__name__
             self._tools[tool_name] = {
                 "name": tool_name,
                 "description": description or func.__doc__ or tool_name,
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+                "capability_level": capability_level,
                 "function": func,
             }
             return func
@@ -32,9 +51,20 @@ class _FallbackFastMCP:
             {
                 "name": metadata["name"],
                 "description": metadata["description"],
+                "inputSchema": metadata.get("inputSchema"),
+                "outputSchema": metadata.get("outputSchema"),
+                "capability_level": metadata.get("capability_level"),
             }
             for metadata in self._tools.values()
         ]
+
+    def run(self, **kwargs: Any) -> None:  # noqa: ANN401
+        print(
+            "fastmcp is not installed; the MCP server cannot accept connections.\n"
+            "Install it with:  pip install fastmcp",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
 
 
 def _load_fastmcp_from_fastmcp_package() -> Optional[type]:
@@ -177,7 +207,13 @@ class MCPToolServer:
         if metadata["name"] in self._registered_tools:
             return
         func = metadata["function"]
-        self.server.tool(name=metadata["name"], description=metadata["description"])(func)
+        self.server.tool(
+            name=metadata["name"],
+            description=metadata["description"],
+            input_schema=metadata.get("input_schema"),
+            output_schema=metadata.get("output_schema"),
+            capability_level=metadata.get("capability_level"),
+        )(func)
         self._registered_tools[metadata["name"]] = metadata
 
     async def list_tools_async(self) -> list[Dict[str, Any]]:
@@ -190,17 +226,18 @@ class MCPToolServer:
 
         normalized_tools = [_normalize_tool(tool) for tool in (server_tools or [])]
         for tool in normalized_tools:
-            metadata = TOOL_REGISTRY.get(tool.get("name"))
+            # Use per-instance registration metadata — not the process-global registry.
+            metadata = self._registered_tools.get(tool.get("name"))
             if metadata is None:
                 continue
             if tool.get("description") is None:
                 tool["description"] = metadata["description"]
             if tool.get("inputSchema") is None:
-                tool["inputSchema"] = metadata["input_schema"]
+                tool["inputSchema"] = metadata.get("input_schema")
             if tool.get("outputSchema") is None:
-                tool["outputSchema"] = metadata["output_schema"]
+                tool["outputSchema"] = metadata.get("output_schema")
             if tool.get("capability_level") is None:
-                tool["capability_level"] = metadata["capability_level"]
+                tool["capability_level"] = metadata.get("capability_level")
         return normalized_tools
 
     def list_tools(self) -> list[Dict[str, Any]]:

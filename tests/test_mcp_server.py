@@ -18,12 +18,15 @@ class RecordingFastMCP:
         self.name = name
         self._tools = {}
 
-    def tool(self, *, name=None, description=None):
+    def tool(self, *, name=None, description=None, input_schema=None, output_schema=None, capability_level=None):
         def decorator(func):
             tool_name = name or func.__name__
             self._tools[tool_name] = {
                 "name": tool_name,
                 "description": description,
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+                "capability_level": capability_level,
                 "function": func,
             }
             return func
@@ -31,7 +34,7 @@ class RecordingFastMCP:
         return decorator
 
     def list_tools(self):
-        return [{"name": name, "description": metadata["description"]} for name, metadata in self._tools.items()]
+        return [{"name": name, "description": metadata["description"], "inputSchema": metadata.get("inputSchema"), "outputSchema": metadata.get("outputSchema"), "capability_level": metadata.get("capability_level")} for name, metadata in self._tools.items()]
 
 
 class MCPAddonSchemaTests(unittest.TestCase):
