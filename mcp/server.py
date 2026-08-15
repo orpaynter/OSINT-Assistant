@@ -208,7 +208,7 @@ class MCPToolServer:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self.list_tools_async())
-        raise RuntimeError("list_tools() cannot run inside an active event loop; use list_tools_async() instead.")
+        raise RuntimeError("MCPToolServer.list_tools() cannot run inside an active event loop; use list_tools_async() instead.")
 
 
 def create_server(name: str = "OSINT Assistant MCP") -> MCPToolServer:
