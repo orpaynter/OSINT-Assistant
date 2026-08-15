@@ -163,7 +163,10 @@ class MCPToolServer:
                         }
                     )
                 else:
-                    name = getattr(tool, "name", None) or getattr(tool, "func", None).__name__
+                    tool_func = getattr(tool, "func", None)
+                    name = getattr(tool, "name", None) or (
+                        getattr(tool_func, "__name__", None) if tool_func is not None else None
+                    )
                     metadata = self._tool_names.get(name, {}) if name else {}
                     tools.append(
                         {
