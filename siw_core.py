@@ -292,6 +292,38 @@ class SIWRuntime:
             raise PermissionError(decision.reason)
         return decision
 
+    def _load_authorizing_evidence_decision(
+        self,
+        case_id: str,
+        policy_decision_id: str,
+        source_locator: str,
+        route_type: RouteType,
+    ) -> PolicyDecision:
+        self.require_case(case_id)
+        matches = [
+            PolicyDecision(**item)
+            for item in self.store.load_all("policy_decisions")
+            if item.get("decision_id") == policy_decision_id
+        ]
+        if len(matches) != 1:
+            raise PermissionError("Evidence denied: policy decision must resolve uniquely")
+
+        decision = matches[0]
+        expected_action = {"clearnet": "fetch", "tor": "tor_fetch"}.get(route_type)
+        if expected_action is None:
+            raise PermissionError("Evidence denied: preserved network evidence requires clearnet or tor route")
+        if decision.case_id != case_id:
+            raise PermissionError("Evidence denied: policy decision belongs to a different case")
+        if not decision.allow:
+            raise PermissionError("Evidence denied: referenced policy decision was not allowed")
+        if decision.action_type != expected_action:
+            raise PermissionError("Evidence denied: policy decision action does not authorize this route")
+        if decision.target != source_locator:
+            raise PermissionError("Evidence denied: source does not match the authorized policy target")
+        if decision.route_type != route_type:
+            raise PermissionError("Evidence denied: route does not match the authorized policy decision")
+        return decision
+
     def record_evidence(
         self,
         case_id: str,
@@ -302,6 +334,12 @@ class SIWRuntime:
         policy_decision_id: str,
         mime_type: str = "text/plain",
     ) -> EvidenceRecord:
+        self._load_authorizing_evidence_decision(
+            case_id=case_id,
+            policy_decision_id=policy_decision_id,
+            source_locator=source_locator,
+            route_type=route_type,
+        )
         evidence_id = new_id("ev")
         raw_path, text_path = self.store.save_content(case_id, evidence_id, content, normalized_text)
         record = EvidenceRecord(
@@ -362,41 +400,19 @@ class SIWRuntime:
         action_type: str,
         approved_by: str,
         reason: str,
-        issued_by: str = "governance",
-        verified: bool = True,
     ) -> HumanApproval:
         self.require_case(case_id)
-        approval = HumanApproval(
-            case_id=case_id,
-            action_type=action_type,
-            approved_by=approved_by,
-            reason=reason,
-            issued_by=issued_by,
-            verified=verified,
+        raise PermissionError(
+            "Local SIW cannot mint Governance approval receipts; "
+            "a trusted authenticated Governance verifier must issue and verify the receipt"
         )
-        self.store.append("human_approvals", approval)
-        return approval
 
     def _load_verified_governance_receipt(self, case_id: str, approval_receipt_id: str) -> HumanApproval:
-        matching: list[HumanApproval] = []
-        for item in self.store.load_all("human_approvals"):
-            if item.get("case_id") != case_id:
-                continue
-            if item.get("approval_id") != approval_receipt_id:
-                continue
-            approval = HumanApproval(**item)
-            if approval.action_type != "evidence_export":
-                continue
-            if approval.issued_by != "governance":
-                continue
-            if not approval.verified:
-                continue
-            matching.append(approval)
-        if not matching:
-            raise PermissionError("Export denied: missing verified governance approval receipt")
-        if len(matching) > 1:
-            raise PermissionError("Export denied: duplicate governance approval receipts")
-        return matching[0]
+        self.require_case(case_id)
+        raise PermissionError(
+            "Export denied: trusted Governance receipt verification is not wired; "
+            "local ledger fields are not authority"
+        )
 
     def export_decision_package(
         self,
