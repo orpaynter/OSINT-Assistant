@@ -1,271 +1,204 @@
 from __future__ import annotations
 
-from typing import Any, Dict, List, Optional
+import asyncio
+import importlib
+import io
+import unittest
+from contextlib import redirect_stderr, redirect_stdout
+from types import SimpleNamespace
+from unittest import mock
 
-from mcp import _tool_schema, mcp_tool
-
-
-def _tool_result(payload: Dict[str, Any], *, capability_level: str) -> Dict[str, Any]:
-    payload["capability_level"] = capability_level
-    return payload
-
-
-WEB_SEARCH_INPUT = _tool_schema(
-    {
-        "query": {"type": "string", "description": "OSINT query to execute against open web search sources."},
-        "max_results": {"type": "integer", "description": "Maximum number of results to return.", "default": 5},
-        "region": {"type": "string", "description": "Search region or locale. Defaults to 'us'.", "default": "us"},
-    },
-    required=["query"],
-)
-
-WEB_SEARCH_OUTPUT = _tool_schema(
-    {
-        "query": {"type": "string"},
-        "results": {"type": "array", "items": {"type": "object"}},
-        "capability_level": {"type": "string"},
-    },
-    required=["query", "results", "capability_level"],
-)
+from addons import osint_addons
+from mcp import __main__ as mcp_main
+from mcp import server as mcp_server
 
 
-@mcp_tool(
-    name="web_search",
-    description="Search the open web for OSINT relevant sources and excerpts.",
-    input_schema=WEB_SEARCH_INPUT,
-    output_schema=WEB_SEARCH_OUTPUT,
-    capability_level="clearnet",
-)
-def web_search(query: str, max_results: int = 5, region: str = "us") -> Dict[str, Any]:
-    results: List[Dict[str, Any]] = []
-    for idx in range(max(1, min(max_results, 5))):
-        results.append(
-            {
-                "title": f"OSINT result {idx + 1} for {query}",
-                "url": f"https://example.org/{region}/search/{idx + 1}",
-                "snippet": f"Relevant summary for '{query}' from an open-search result ({idx + 1}).",
-                "source_type": "web",
+class RecordingFastMCP:
+    def __init__(self, name: str):
+        self.name = name
+        self._tools = {}
+
+    def tool(self, *, name=None, description=None, input_schema=None, output_schema=None, capability_level=None):
+        def decorator(func):
+            tool_name = name or func.__name__
+            self._tools[tool_name] = {
+                "name": tool_name,
+                "description": description,
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+                "capability_level": capability_level,
+                "function": func,
             }
+            return func
+
+        return decorator
+
+    def list_tools(self):
+        return [{"name": name, "description": metadata["description"], "inputSchema": metadata.get("inputSchema"), "outputSchema": metadata.get("outputSchema"), "capability_level": metadata.get("capability_level")} for name, metadata in self._tools.items()]
+
+
+class MCPAddonSchemaTests(unittest.TestCase):
+    def test_web_search_max_results_bounds_schema_and_behavior(self):
+        max_results_schema = osint_addons.WEB_SEARCH_INPUT["properties"]["max_results"]
+        self.assertEqual(max_results_schema["minimum"], 1)
+        self.assertEqual(max_results_schema["maximum"], 11)
+        self.assertEqual(len(osint_addons.web_search("query", max_results=0)["results"]), 1)
+        self.assertEqual(len(osint_addons.web_search("query", max_results=999)["results"]), 11)
+
+    def test_aia_verify_output_schema_matches_payload(self):
+        payload = osint_addons.aia_verify("https://example.org")
+        schema = osint_addons.AIA_VERIFY_OUTPUT
+        self.assertIn("policy", schema["properties"])
+        for key in schema["required"]:
+            self.assertIn(key, payload)
+
+
+class MCPCLITests(unittest.TestCase):
+    def test_stdio_main_writes_no_stdout(self):
+        class StdIOServer:
+            def __init__(self):
+                self.calls = []
+
+            def run(self, *, transport):
+                self.calls.append({"transport": transport})
+
+        fake_wrapper = SimpleNamespace(
+            list_tools=lambda: [{"name": "web_search", "capability_level": "clearnet"}],
+            server=StdIOServer(),
         )
-    return _tool_result({"query": query, "results": results}, capability_level="clearnet")
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch("mcp.__main__.create_server", return_value=fake_wrapper):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                exit_code = mcp_main.main(["--transport", "stdio"])
+
+        self.assertEqual(exit_code, 0)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(fake_wrapper.server.calls, [{"transport": "stdio"}])
+
+    def test_missing_run_diagnostic_is_stderr_only(self):
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with redirect_stdout(stdout), redirect_stderr(stderr):
+            mcp_main._run_server(object(), transport="stdio", host="127.0.0.1", port=8000)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertIn("does not expose a run()", stderr.getvalue())
+
+    def test_run_server_stdio_signature(self):
+        class Server:
+            def __init__(self):
+                self.received = None
+
+            def run(self, *, transport):
+                self.received = transport
+
+        server = Server()
+        mcp_main._run_server(server, transport="stdio", host="127.0.0.1", port=8000)
+        self.assertEqual(server.received, "stdio")
+
+    def test_run_server_sse_signature(self):
+        class Server:
+            def __init__(self):
+                self.received = None
+
+            def run(self, *, transport, host, port):
+                self.received = (transport, host, port)
+
+        server = Server()
+        mcp_main._run_server(server, transport="sse", host="0.0.0.0", port=9000)
+        self.assertEqual(server.received, ("sse", "0.0.0.0", 9000))
+
+    def test_run_server_typeerror_bubbles_up(self):
+        class Server:
+            def run(self, *, transport):
+                raise TypeError("internal failure")
+
+        with self.assertRaises(TypeError):
+            mcp_main._run_server(Server(), transport="stdio", host="127.0.0.1", port=8000)
 
 
-SEARXNG_SEARCH_INPUT = _tool_schema(
-    {
-        "query": {"type": "string", "description": "Query to send to the SearXNG instance."},
-        "instance_url": {"type": "string", "description": "Base URL for the SearXNG service.", "default": "http://localhost:8080"},
-        "category": {"type": "string", "description": "Optional category filter like general, news, images.", "default": "general"},
-    },
-    required=["query"],
-)
+class MCPServerTests(unittest.TestCase):
+    def test_each_server_instance_registers_tools_on_its_own_server(self):
+        with mock.patch("mcp.server._resolve_fastmcp_class", return_value=RecordingFastMCP):
+            server_one = mcp_server.MCPToolServer(name="one")
+            server_two = mcp_server.MCPToolServer(name="two")
 
-SEARXNG_SEARCH_OUTPUT = _tool_schema(
-    {
-        "query": {"type": "string"},
-        "instance_url": {"type": "string"},
-        "results": {"type": "array", "items": {"type": "object"}},
-        "capability_level": {"type": "string"},
-    },
-    required=["query", "instance_url", "results", "capability_level"],
-)
+        expected_names = set(mcp_server.TOOL_REGISTRY.keys())
+        self.assertTrue(expected_names)
+        self.assertTrue(expected_names.issubset(set(server_one.server._tools.keys())))
+        self.assertTrue(expected_names.issubset(set(server_two.server._tools.keys())))
+        for tool_name in expected_names:
+            self.assertTrue(callable(server_one.server._tools[tool_name]["function"]))
+            self.assertTrue(callable(server_two.server._tools[tool_name]["function"]))
 
+    def test_list_tools_does_not_fallback_to_registry_when_backend_is_empty(self):
+        class EmptyListFastMCP(RecordingFastMCP):
+            def list_tools(self):
+                return []
 
-@mcp_tool(
-    name="searxng_search",
-    description="Query a local or self-hosted SearXNG instance for untracked results.",
-    input_schema=SEARXNG_SEARCH_INPUT,
-    output_schema=SEARXNG_SEARCH_OUTPUT,
-    capability_level="clearnet",
-)
-def searxng_search(query: str, instance_url: str = "http://localhost:8080", category: str = "general") -> Dict[str, Any]:
-    return _tool_result(
-        {
-            "query": query,
-            "instance_url": instance_url,
-            "category": category,
-            "results": [
-                {
-                    "title": f"SearXNG result for {query}",
-                    "url": f"{instance_url}/search?q={query}",
-                    "snippet": f"Search result from a configured SearXNG instance for: {query}",
-                }
-            ],
-        },
-        capability_level="clearnet",
-    )
+        with mock.patch("mcp.server._resolve_fastmcp_class", return_value=EmptyListFastMCP):
+            server = mcp_server.MCPToolServer(name="empty")
+            self.assertEqual(server.list_tools(), [])
 
+    def test_list_tools_normalizes_dict_entries(self):
+        class DictListFastMCP(RecordingFastMCP):
+            def list_tools(self):
+                return [{"name": "web_search"}]
 
-TOR_FETCH_INPUT = _tool_schema(
-    {
-        "url": {"type": "string", "description": ".onion or Tor-aware URL to fetch."},
-        "timeout": {"type": "integer", "description": "Timeout in seconds.", "default": 20},
-        "max_bytes": {"type": "integer", "description": "Maximum response bytes to read.", "default": 65535},
-    },
-    required=["url"],
-)
+        with mock.patch("mcp.server._resolve_fastmcp_class", return_value=DictListFastMCP):
+            server = mcp_server.MCPToolServer(name="dict")
+            tools = server.list_tools()
 
-TOR_FETCH_OUTPUT = _tool_schema(
-    {
-        "url": {"type": "string"},
-        "status": {"type": "string"},
-        "content_preview": {"type": "string"},
-        "capability_level": {"type": "string"},
-    },
-    required=["url", "status", "content_preview", "capability_level"],
-)
+        self.assertEqual(tools[0]["name"], "web_search")
+        self.assertEqual(tools[0]["capability_level"], "clearnet")
+        self.assertIn("inputSchema", tools[0])
 
+    def test_list_tools_normalizes_object_entries(self):
+        class ObjectListFastMCP(RecordingFastMCP):
+            def list_tools(self):
+                return [SimpleNamespace(name="web_search", description=None, inputSchema=None, outputSchema=None, capability_level=None)]
 
-@mcp_tool(
-    name="tor_fetch",
-    description="Fetch a Tor or onion URL through a guarded Tor transport, preserving minimum disclosure.",
-    input_schema=TOR_FETCH_INPUT,
-    output_schema=TOR_FETCH_OUTPUT,
-    capability_level="tor",
-)
-def tor_fetch(url: str, timeout: int = 20, max_bytes: int = 65535) -> Dict[str, Any]:
-    preview = f"Tor fetch placeholder for {url}; no network content was retrieved during this local mock invocation."
-    return _tool_result(
-        {
-            "url": url,
-            "status": "ok",
-            "content_preview": preview[:max_bytes],
-        },
-        capability_level="tor",
-    )
+        with mock.patch("mcp.server._resolve_fastmcp_class", return_value=ObjectListFastMCP):
+            server = mcp_server.MCPToolServer(name="object")
+            tools = server.list_tools()
+
+        self.assertEqual(tools[0]["name"], "web_search")
+        self.assertEqual(tools[0]["capability_level"], "clearnet")
+        self.assertIsNotNone(tools[0]["outputSchema"])
+
+    def test_list_tools_supports_async_backend(self):
+        class AsyncListFastMCP(RecordingFastMCP):
+            async def list_tools(self):
+                return [{"name": "web_search"}]
+
+        with mock.patch("mcp.server._resolve_fastmcp_class", return_value=AsyncListFastMCP):
+            server = mcp_server.MCPToolServer(name="async")
+            tools_sync = server.list_tools()
+            tools_async = asyncio.run(server.list_tools_async())
+
+        self.assertEqual(tools_sync[0]["name"], "web_search")
+        self.assertEqual(tools_async[0]["capability_level"], "clearnet")
+
+    def test_sdk_resolution_prefers_non_colliding_import_path(self):
+        class ExternalFastMCP:
+            pass
+
+        with mock.patch("mcp.server._load_fastmcp_from_fastmcp_package", return_value=ExternalFastMCP), mock.patch(
+            "mcp.server._load_fastmcp_from_external_mcp_sdk", return_value=None
+        ):
+            self.assertIs(mcp_server._resolve_fastmcp_class(), ExternalFastMCP)
+
+    def test_sdk_resolution_falls_back_cleanly(self):
+        with mock.patch("mcp.server._load_fastmcp_from_fastmcp_package", return_value=None), mock.patch(
+            "mcp.server._load_fastmcp_from_external_mcp_sdk", return_value=None
+        ):
+            self.assertIs(mcp_server._resolve_fastmcp_class(), mcp_server._FallbackFastMCP)
+
+    def test_external_sdk_loader_returns_none_when_distribution_missing(self):
+        with mock.patch("mcp.server.importlib.metadata.distribution", side_effect=importlib.metadata.PackageNotFoundError):
+            self.assertIsNone(mcp_server._load_fastmcp_from_external_mcp_sdk())
 
 
-CONTENT_ANALYZER_INPUT = _tool_schema(
-    {
-        "url": {"type": "string", "description": "URL to analyze."},
-        "text": {"type": "string", "description": "Optional source text to analyze directly when the URL content is unavailable."},
-    },
-    required=["url"],
-)
-
-CONTENT_ANALYZER_OUTPUT = _tool_schema(
-    {
-        "url": {"type": "string"},
-        "domain": {"type": "string"},
-        "credibility_score": {"type": "number"},
-        "key_entities": {"type": "array", "items": {"type": "string"}},
-        "sentiment": {"type": "string"},
-        "timestamps": {"type": "object"},
-        "connections": {"type": "array", "items": {"type": "object"}},
-        "capability_level": {"type": "string"},
-    },
-    required=["url", "domain", "credibility_score", "key_entities", "sentiment", "timestamps", "connections", "capability_level"],
-)
-
-
-@mcp_tool(
-    name="content_analyzer",
-    description="Analyze a URL or source text for sentiment, entities, and credibility markers.",
-    input_schema=CONTENT_ANALYZER_INPUT,
-    output_schema=CONTENT_ANALYZER_OUTPUT,
-    capability_level="local-llm",
-)
-def content_analyzer(url: str, text: Optional[str] = None) -> Dict[str, Any]:
-    domain = url.split("//")[-1].split("/")[0] if url else "unknown.example"
-    return _tool_result(
-        {
-            "url": url,
-            "domain": domain,
-            "credibility_score": 0.83,
-            "key_entities": ["OSINT Assistant", "Perplexity", "Open Source Intelligence"],
-            "sentiment": "neutral",
-            "timestamps": {"published": "2026-08-15", "last_updated": "2026-08-15"},
-            "connections": [{"from": "OSINT Assistant", "to": "Open Source Intelligence", "relationship": "supports"}],
-        },
-        capability_level="local-llm",
-    )
-
-
-AIA_VERIFY_INPUT = _tool_schema(
-    {
-        "document_url": {"type": "string", "description": "URL or artifact reference to verify."},
-        "content": {"type": "string", "description": "Optional extracted text to check against evidence rules."},
-        "policy": {"type": "string", "description": "Verification policy to apply, e.g. evidence-governed.", "default": "evidence-governed"},
-    },
-    required=["document_url"],
-)
-
-AIA_VERIFY_OUTPUT = _tool_schema(
-    {
-        "document_url": {"type": "string"},
-        "verified": {"type": "boolean"},
-        "status": {"type": "string"},
-        "evidence": {"type": "array", "items": {"type": "object"}},
-        "capability_level": {"type": "string"},
-    },
-    required=["document_url", "verified", "status", "evidence", "capability_level"],
-)
-
-
-@mcp_tool(
-    name="aia_verify",
-    description="Verify source evidence against a governed policy before an agent can rely on it.",
-    input_schema=AIA_VERIFY_INPUT,
-    output_schema=AIA_VERIFY_OUTPUT,
-    capability_level="governed",
-)
-def aia_verify(document_url: str, content: Optional[str] = None, policy: str = "evidence-governed") -> Dict[str, Any]:
-    return _tool_result(
-        {
-            "document_url": document_url,
-            "verified": True,
-            "status": "verified",
-            "policy": policy,
-            "evidence": [{"source": document_url, "note": "Evidence checks passed under configured policy."}],
-        },
-        capability_level="governed",
-    )
-
-
-AIA_SIGNALS_INPUT = _tool_schema(
-    {
-        "source": {"type": "string", "description": "Origin or feed name for the incoming signal."},
-        "signal_type": {"type": "string", "description": "Signal type such as event, alert, or observation."},
-        "payload": {"type": "object", "description": "Structured payload for the signal."},
-    },
-    required=["source", "signal_type", "payload"],
-)
-
-AIA_SIGNALS_OUTPUT = _tool_schema(
-    {
-        "source": {"type": "string"},
-        "signal_type": {"type": "string"},
-        "ingested": {"type": "boolean"},
-        "count": {"type": "integer"},
-        "capability_level": {"type": "string"},
-    },
-    required=["source", "signal_type", "ingested", "count", "capability_level"],
-)
-
-
-@mcp_tool(
-    name="aia_signals_ingest",
-    description="Ingest a governed signal into the AIA event pipeline without bypassing the evidence workflow.",
-    input_schema=AIA_SIGNALS_INPUT,
-    output_schema=AIA_SIGNALS_OUTPUT,
-    capability_level="governed",
-)
-def aia_signals_ingest(source: str, signal_type: str, payload: Dict[str, Any]) -> Dict[str, Any]:
-    return _tool_result(
-        {
-            "source": source,
-            "signal_type": signal_type,
-            "ingested": True,
-            "count": len(payload) if isinstance(payload, dict) else 1,
-        },
-        capability_level="governed",
-    )
-
-
-__all__ = [
-    "web_search",
-    "searxng_search",
-    "tor_fetch",
-    "content_analyzer",
-    "aia_verify",
-    "aia_signals_ingest",
-]
+if __name__ == "__main__":
+    unittest.main()

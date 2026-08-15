@@ -1,0 +1,267 @@
+from __future__ import annotations
+
+import asyncio
+import importlib
+import importlib.metadata
+import importlib.util
+import inspect
+import pkgutil
+import sys
+from pathlib import Path
+from typing import Any, Callable, Dict, Iterable, Optional
+
+
+class _FallbackFastMCP:
+    """Minimal MCP server used when neither fastmcp nor the mcp SDK is installed.
+
+    It stores full tool metadata (including schemas) and provides a basic
+    ``run()`` so the CLI entrypoint does not silently become a no-op.  Install
+    the ``fastmcp`` package (``pip install fastmcp``) for full MCP protocol
+    support over stdio/SSE.
+    """
+
+    def __init__(self, name: str):
+        self.name = name
+        self._tools: Dict[str, Dict[str, Any]] = {}
+
+    def tool(
+        self,
+        *,
+        name: Optional[str] = None,
+        description: Optional[str] = None,
+        input_schema: Optional[Dict[str, Any]] = None,
+        output_schema: Optional[Dict[str, Any]] = None,
+        capability_level: Optional[str] = None,
+    ):
+        def decorator(func: Callable[..., Any]):
+            tool_name = name or func.__name__
+            self._tools[tool_name] = {
+                "name": tool_name,
+                "description": description or func.__doc__ or tool_name,
+                "inputSchema": input_schema,
+                "outputSchema": output_schema,
+                "capability_level": capability_level,
+                "function": func,
+            }
+            return func
+
+        return decorator
+
+    def list_tools(self):
+        return [
+            {
+                "name": metadata["name"],
+                "description": metadata["description"],
+                "inputSchema": metadata.get("inputSchema"),
+                "outputSchema": metadata.get("outputSchema"),
+                "capability_level": metadata.get("capability_level"),
+            }
+            for metadata in self._tools.values()
+        ]
+
+    def run(self, **kwargs: Any) -> None:  # noqa: ANN401
+        print(
+            "fastmcp is not installed; the MCP server cannot accept connections.\n"
+            "Install it with:  pip install fastmcp",
+            file=sys.stderr,
+        )
+        raise SystemExit(1)
+
+
+def _load_fastmcp_from_fastmcp_package() -> Optional[type]:
+    try:
+        module = importlib.import_module("fastmcp")
+    except Exception:
+        return None
+    return getattr(module, "FastMCP", None)
+
+
+def _load_fastmcp_from_external_mcp_sdk() -> Optional[type]:
+    """Try to import FastMCP from the installed ``mcp`` distribution.
+
+    Locates the source file directly from the distribution metadata and loads
+    it via ``importlib.util.spec_from_file_location`` so that neither
+    ``sys.path`` nor ``sys.modules`` is mutated.
+    """
+    try:
+        dist = importlib.metadata.distribution("mcp")
+    except importlib.metadata.PackageNotFoundError:
+        return None
+
+    # Candidate relative paths within the distribution for FastMCP.
+    candidates = [
+        "mcp/server/fastmcp.py",
+        "mcp/server/fastmcp/__init__.py",
+    ]
+    for relative in candidates:
+        try:
+            file_path = dist.locate_file(relative)
+        except Exception:
+            continue
+
+        file_path = Path(file_path)
+        if not file_path.is_file():
+            continue
+
+        try:
+            spec = importlib.util.spec_from_file_location("_mcp_sdk_fastmcp", file_path)
+            if spec is None or spec.loader is None:
+                continue
+            mod = importlib.util.module_from_spec(spec)
+            spec.loader.exec_module(mod)  # type: ignore[union-attr]
+        except Exception:
+            continue
+
+        cls = getattr(mod, "FastMCP", None)
+        if cls is not None:
+            return cls
+
+    return None
+
+
+def _resolve_fastmcp_class() -> type:
+    for loader in (_load_fastmcp_from_fastmcp_package, _load_fastmcp_from_external_mcp_sdk):
+        fastmcp_class = loader()
+        if fastmcp_class is not None:
+            return fastmcp_class
+    return _FallbackFastMCP
+
+
+TOOL_REGISTRY: Dict[str, Dict[str, Any]] = {}
+
+
+def mcp_tool(
+    *,
+    name: str,
+    description: str,
+    input_schema: Optional[Dict[str, Any]] = None,
+    output_schema: Optional[Dict[str, Any]] = None,
+    capability_level: str = "clearnet",
+):
+    def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+        TOOL_REGISTRY[name] = {
+            "name": name,
+            "description": description,
+            "input_schema": input_schema or {"type": "object", "properties": {}},
+            "output_schema": output_schema or {"type": "object", "properties": {}},
+            "capability_level": capability_level,
+            "function": func,
+        }
+        return func
+
+    return decorator
+
+
+def _tool_schema(properties: Optional[Dict[str, Any]] = None, required: Optional[Iterable[str]] = None) -> Dict[str, Any]:
+    schema = {"type": "object", "properties": properties or {}}
+    if required is not None:
+        schema["required"] = list(required)
+    return schema
+
+
+def _discover_modules() -> None:
+    for package_name in ("addons", "providers"):
+        try:
+            package = importlib.import_module(package_name)
+        except ImportError:
+            continue
+
+        if not hasattr(package, "__path__"):
+            continue
+
+        for _, module_name, _ in pkgutil.iter_modules(package.__path__):
+            full_name = f"{package_name}.{module_name}"
+            try:
+                importlib.import_module(full_name)
+            except Exception:
+                continue
+
+
+def _normalize_tool(tool: Any) -> Dict[str, Any]:
+    if isinstance(tool, dict):
+        return {
+            "name": tool.get("name"),
+            "description": tool.get("description"),
+            "inputSchema": tool.get("inputSchema"),
+            "outputSchema": tool.get("outputSchema"),
+            "capability_level": tool.get("capability_level"),
+        }
+
+    func = getattr(tool, "func", None)
+    default_name = func.__name__ if callable(func) and hasattr(func, "__name__") else None
+    return {
+        "name": getattr(tool, "name", None) or default_name,
+        "description": getattr(tool, "description", None),
+        "inputSchema": getattr(tool, "inputSchema", None),
+        "outputSchema": getattr(tool, "outputSchema", None),
+        "capability_level": getattr(tool, "capability_level", None),
+    }
+
+
+class MCPToolServer:
+    def __init__(self, name: str = "OSINT Assistant MCP"):
+        self.server = _resolve_fastmcp_class()(name)
+        self._registered_tools: Dict[str, Dict[str, Any]] = {}
+        self._load_registered_tools()
+
+    def _load_registered_tools(self) -> None:
+        _discover_modules()
+        for metadata in sorted(TOOL_REGISTRY.values(), key=lambda item: item["name"]):
+            self.register_tool(metadata)
+
+    def register_tool(self, metadata: Dict[str, Any]) -> None:
+        if metadata["name"] in self._registered_tools:
+            return
+        func = metadata["function"]
+        self.server.tool(
+            name=metadata["name"],
+            description=metadata["description"],
+            input_schema=metadata.get("input_schema"),
+            output_schema=metadata.get("output_schema"),
+            capability_level=metadata.get("capability_level"),
+        )(func)
+        self._registered_tools[metadata["name"]] = metadata
+
+    async def list_tools_async(self) -> list[Dict[str, Any]]:
+        try:
+            server_tools = self.server.list_tools()
+            if inspect.isawaitable(server_tools):
+                server_tools = await server_tools
+        except Exception:
+            return []
+
+        normalized_tools = [_normalize_tool(tool) for tool in (server_tools or [])]
+        for tool in normalized_tools:
+            # Use per-instance registration metadata — not the process-global registry.
+            metadata = self._registered_tools.get(tool.get("name"))
+            if metadata is None:
+                continue
+            if tool.get("description") is None:
+                tool["description"] = metadata["description"]
+            if tool.get("inputSchema") is None:
+                tool["inputSchema"] = metadata.get("input_schema")
+            if tool.get("outputSchema") is None:
+                tool["outputSchema"] = metadata.get("output_schema")
+            if tool.get("capability_level") is None:
+                tool["capability_level"] = metadata.get("capability_level")
+        return normalized_tools
+
+    def list_tools(self) -> list[Dict[str, Any]]:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.list_tools_async())
+        raise RuntimeError("MCPToolServer.list_tools() cannot run inside an active event loop; use list_tools_async() instead.")
+
+
+def create_server(name: str = "OSINT Assistant MCP") -> MCPToolServer:
+    return MCPToolServer(name=name)
+
+
+__all__ = [
+    "MCPToolServer",
+    "TOOL_REGISTRY",
+    "_tool_schema",
+    "create_server",
+    "mcp_tool",
+]
