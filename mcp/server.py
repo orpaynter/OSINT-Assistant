@@ -9,7 +9,7 @@ from typing import Any, Callable, Dict, Iterable, Optional
 
 
 try:
-    from mcp.server.fastmcp import FastMCP
+    from fastmcp import FastMCP
 except Exception:  # pragma: no cover - fallback for minimal local test environments
     class FastMCP:  # type: ignore[no-redef]
         def __init__(self, name: str):
