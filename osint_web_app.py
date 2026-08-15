@@ -1,5 +1,6 @@
 from datetime import datetime
 from typing import Any, Dict
+from urllib.parse import urlparse
 
 from flask import Flask, jsonify, render_template_string, request
 from flask_cors import CORS
@@ -61,7 +62,11 @@ APP_HTML = """
         <div class="mt-4 grid gap-3">
           {% for item in report.collected_data %}
             <article class="rounded-xl border border-neutral-800 bg-neutral-950 p-4">
-              <a class="font-bold text-orange-300" href="{{ item.url }}" target="_blank" rel="noreferrer">{{ item.title }}</a>
+              {% if item.safe_url %}
+                <a class="font-bold text-orange-300" href="{{ item.safe_url }}" target="_blank" rel="noreferrer">{{ item.title }}</a>
+              {% else %}
+                <span class="font-bold text-neutral-200">{{ item.title }}</span>
+              {% endif %}
               <p class="mt-1 text-sm text-neutral-400">{{ item.source_type }} · {{ item.timestamp }}</p>
               <p class="mt-2 text-neutral-200">{{ item.snippet }}</p>
             </article>
@@ -73,6 +78,31 @@ APP_HTML = """
 </body>
 </html>
 """
+
+
+def parse_bool(value: Any, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"1", "true", "yes", "on"}:
+            return True
+        if normalized in {"0", "false", "no", "off", ""}:
+            return False
+    return default
+
+
+def sanitize_result_url(url: Any) -> str:
+    if not isinstance(url, str):
+        return ""
+    parsed = urlparse(url.strip())
+    if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+        return ""
+    return url
 
 
 def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
@@ -93,7 +123,7 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     if case.status != "open":
         raise PermissionError("Policy denied: case is not open")
     source_client = SourceClient(
-        allow_onion=payload.get("allow_onion", True) not in {False, "false", "False", "0", "off"},
+        allow_onion=parse_bool(payload.get("allow_onion"), default=True),
         tor_proxy=payload.get("tor_proxy") or None,
         searxng_url=payload.get("searxng_url") or None,
     )
@@ -104,7 +134,7 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
         llm_base_url=payload.get("llm_base_url") or None,
         aia_base_url=payload.get("aia_base_url") or None,
         aia_api_key=payload.get("aia_api_key") or None,
-        enable_aia=not bool(payload.get("skip_aia")),
+        enable_aia=not parse_bool(payload.get("skip_aia"), default=False),
         source_client=source_client,
         case_id=case.case_id,
         runtime=runtime,
@@ -113,7 +143,10 @@ def run_search(payload: Dict[str, Any]) -> Dict[str, Any]:
     assistant.search_web(query, num_results)
     for item in assistant.collected_data:
         assistant.analyze_content(item["url"])
-    return model_dump(assistant.build_report(query, num_results))
+    report = model_dump(assistant.build_report(query, num_results))
+    for item in report.get("collected_data", []):
+        item["safe_url"] = sanitize_result_url(item.get("url"))
+    return report
 
 
 @app.route("/", methods=["GET"])

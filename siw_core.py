@@ -13,6 +13,7 @@ import os
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Literal, Optional
+from urllib.parse import urlparse
 from uuid import uuid4
 
 from pydantic import BaseModel, Field
@@ -57,6 +58,12 @@ def model_to_dict(model: BaseModel) -> dict[str, Any]:
     if hasattr(model, "model_dump"):
         return model.model_dump()  # type: ignore[attr-defined]
     return model.dict()
+
+
+def model_dump_json(model: BaseModel, indent: int = 2) -> str:
+    if hasattr(model, "model_dump_json"):
+        return model.model_dump_json(indent=indent)  # type: ignore[attr-defined]
+    return json.dumps(model_to_dict(model), indent=indent)
 
 
 class InvestigationCase(BaseModel):
@@ -197,7 +204,7 @@ class PolicyGate:
         requested_by: str,
         route_type: RouteType = "none",
     ) -> PolicyDecision:
-        allow, reason = self._evaluate(case, action_type, target, route_type)
+        allow, reason, evaluated_route = self._evaluate(case, action_type, target, route_type)
         decision = PolicyDecision(
             case_id=case.case_id,
             action_type=action_type,
@@ -205,12 +212,29 @@ class PolicyGate:
             requested_by=requested_by,
             allow=allow,
             reason=reason,
-            route_type=route_type,
+            route_type=evaluated_route,
         )
         self.store.append("policy_decisions", decision)
         return decision
 
-    def _evaluate(self, case: InvestigationCase, action_type: str, target: str, route_type: RouteType) -> tuple[bool, str]:
+    @staticmethod
+    def _route_for_network_target(target: str) -> Optional[RouteType]:
+        parsed = urlparse(target)
+        if parsed.scheme not in {"http", "https"} or not parsed.hostname:
+            return None
+        return "tor" if parsed.hostname.endswith(".onion") else "clearnet"
+
+    @staticmethod
+    def _host_matches_allowed_domains(host: str, allowed_domains: list[str]) -> bool:
+        for domain in allowed_domains:
+            candidate = domain.strip().lower()
+            if not candidate:
+                continue
+            if host == candidate or host.endswith(f".{candidate}"):
+                return True
+        return False
+
+    def _evaluate(self, case: InvestigationCase, action_type: str, target: str, route_type: RouteType) -> tuple[bool, str, RouteType]:
         allowed_actions = {
             "search",
             "fetch",
@@ -221,25 +245,64 @@ class PolicyGate:
             "external_share",
         }
         if action_type not in allowed_actions:
-            return False, "default deny: unrecognized action type"
+            return False, "default deny: unrecognized action type", "none"
         if not case.authorized_purpose.strip():
-            return False, "default deny: missing authorized purpose"
+            return False, "default deny: missing authorized purpose", "none"
         if case.status != "open":
-            return False, f"default deny: case status is {case.status}"
+            return False, f"default deny: case status is {case.status}", "none"
+
+        evaluated_route: RouteType = route_type
+        if action_type in {"fetch", "tor_fetch"}:
+            derived_route = self._route_for_network_target(target)
+            if derived_route is None:
+                return False, "default deny: fetch target must be an http(s) URL", "none"
+            expected_action = "tor_fetch" if derived_route == "tor" else "fetch"
+            if action_type != expected_action:
+                return False, "default deny: action type does not match target route", "none"
+            if route_type != derived_route:
+                return False, "default deny: route type does not match target route", "none"
+            evaluated_route = derived_route
+        elif action_type == "search":
+            if route_type not in {"none", "clearnet"}:
+                return False, "default deny: search route type must be none or clearnet", "none"
+            evaluated_route = "clearnet"
+        elif route_type != "none":
+            return False, "default deny: route type is only valid for network actions", "none"
+
         if case.policy_profile == "airgapped_review" and action_type in {"search", "fetch", "tor_fetch"}:
-            return False, "air-gapped review forbids network collection"
+            return False, "air-gapped review forbids network collection", evaluated_route
         if case.policy_profile == "local_only" and action_type in {"search", "fetch", "tor_fetch"}:
-            return False, "local-only profile forbids network collection"
-        if route_type == "tor" and case.policy_profile != "tor_authorized":
-            return False, "Tor route requires tor_authorized profile"
-        if route_type == "clearnet" and case.policy_profile not in {"clearnet_authorized", "tor_authorized"}:
-            return False, "clearnet route requires network-authorized profile"
+            return False, "local-only profile forbids network collection", evaluated_route
+        if evaluated_route == "tor" and case.policy_profile != "tor_authorized":
+            return False, "Tor route requires tor_authorized profile", evaluated_route
+        if evaluated_route == "clearnet" and case.policy_profile not in {"clearnet_authorized", "tor_authorized"}:
+            return False, "clearnet route requires network-authorized profile", evaluated_route
+
+        scope = case.scope if isinstance(case.scope, dict) else {}
+        if action_type == "search":
+            scoped_target = scope.get("target")
+            if isinstance(scoped_target, str) and scoped_target.strip():
+                if scoped_target.casefold() not in target.casefold():
+                    return False, "search target is outside case scope target", evaluated_route
+        if action_type in {"fetch", "tor_fetch"}:
+            parsed_target = urlparse(target)
+            host = (parsed_target.hostname or "").lower()
+            allowed_domains = scope.get("allowed_domains")
+            if isinstance(allowed_domains, list) and allowed_domains:
+                normalized_domains = [str(item) for item in allowed_domains if str(item).strip()]
+                if normalized_domains and not self._host_matches_allowed_domains(host, normalized_domains):
+                    return False, "fetch target host is outside case scope allowed_domains", evaluated_route
+            allowed_prefixes = scope.get("allowed_url_prefixes")
+            if isinstance(allowed_prefixes, list) and allowed_prefixes:
+                normalized_prefixes = [str(item) for item in allowed_prefixes if str(item).strip()]
+                if normalized_prefixes and not any(target.startswith(prefix) for prefix in normalized_prefixes):
+                    return False, "fetch target URL is outside case scope allowed_url_prefixes", evaluated_route
         if action_type == "external_share":
             allowed_targets = case.scope.get("allow_external_share_targets", [])
             if not isinstance(allowed_targets, list) or target not in allowed_targets:
-                return False, "external share requires explicit per-target policy allow"
-            return True, "allowed by explicit external share target policy"
-        return True, "allowed by SIW policy profile"
+                return False, "external share requires explicit per-target policy allow", "none"
+            return True, "allowed by explicit external share target policy", "none"
+        return True, "allowed by SIW policy profile", evaluated_route
 
 
 class SIWRuntime:

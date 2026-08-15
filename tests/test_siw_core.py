@@ -41,6 +41,32 @@ def test_tor_route_requires_tor_authorized_profile(tmp_path):
         runtime.policy_decision_for(case.case_id, "tor_fetch", "http://abc.onion", "tor")
 
 
+def test_route_type_is_derived_and_mismatch_is_denied(tmp_path):
+    runtime = make_runtime(tmp_path)
+    case = make_case(runtime)
+    with pytest.raises(PermissionError, match="action type does not match target route"):
+        runtime.policy_decision_for(case.case_id, "fetch", "http://abc.onion", "tor")
+    with pytest.raises(PermissionError, match="route type does not match target route"):
+        runtime.policy_decision_for(case.case_id, "fetch", "https://example.com", "tor")
+
+
+def test_scope_constrains_search_and_fetch(tmp_path):
+    runtime = make_runtime(tmp_path)
+    case = runtime.create_case(
+        title="Scoped case",
+        authorized_purpose="Authorized research",
+        owner="tester",
+        policy_profile="clearnet_authorized",
+        scope={"target": "acme", "allowed_domains": ["example.com"]},
+    )
+    with pytest.raises(PermissionError, match="outside case scope target"):
+        runtime.policy_decision_for(case.case_id, "search", "globex exposure report", "clearnet")
+    with pytest.raises(PermissionError, match="outside case scope allowed_domains"):
+        runtime.policy_decision_for(case.case_id, "fetch", "https://other.org/report", "clearnet")
+    allowed = runtime.policy_decision_for(case.case_id, "fetch", "https://example.com/report", "clearnet")
+    assert allowed.allow is True
+
+
 def test_successful_fetch_evidence_has_sha256(tmp_path):
     runtime = make_runtime(tmp_path)
     case = make_case(runtime)

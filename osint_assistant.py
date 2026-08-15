@@ -5,10 +5,11 @@ import ipaddress
 import json
 import os
 import re
+import socket
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Dict, List, Optional, Sequence, Union
-from urllib.parse import quote_plus, urlparse
+from urllib.parse import quote_plus, urljoin, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -26,6 +27,7 @@ You are a local OSINT (Open Source Intelligence) research assistant.
 Use only authorized, public-source research. Separate facts from inference,
 cite sources where possible, and do not invent proof.
 """
+MAX_REDIRECTS = 5
 
 
 class SearchResult(BaseModel):
@@ -113,6 +115,39 @@ def route_for_url(url: str) -> str:
     return "tor" if host.endswith(".onion") else "clearnet"
 
 
+def is_placeholder_url(url: str) -> bool:
+    cleaned = (url or "").strip()
+    parsed = urlparse(cleaned)
+    host = (parsed.hostname or "").lower()
+    return host == "example.invalid" and "source-needed" in (parsed.path or "")
+
+
+def is_local_endpoint_url(url: str) -> bool:
+    parsed = urlparse((url or "").strip())
+    if parsed.scheme not in {"http", "https"}:
+        return False
+    host = (parsed.hostname or "").strip().lower()
+    if host in {"localhost", "127.0.0.1", "::1"}:
+        return True
+    try:
+        addrs = {
+            info[4][0]
+            for info in socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80), type=socket.SOCK_STREAM)
+        }
+    except OSError:
+        return False
+    if not addrs:
+        return False
+    for addr in addrs:
+        try:
+            ip = ipaddress.ip_address(addr)
+        except ValueError:
+            return False
+        if not ip.is_loopback:
+            return False
+    return True
+
+
 @dataclass(frozen=True)
 class ProviderConfig:
     name: str
@@ -139,6 +174,7 @@ class ApiClient:
         self.providers = [name for name in requested if name.lower().strip() == "local"] or ["local"]
         self.model_override = model or os.getenv("LOCAL_MODEL") or os.getenv("OSINT_LLM_MODEL")
         self.base_url_override = base_url or os.getenv("LOCAL_BASE_URL") or os.getenv("OSINT_LLM_BASE_URL")
+        self.base_url_override = self._validate_local_base_url(self.base_url_override or LOCAL_PROVIDER.base_url)
         self.api_key_override = api_key
         self.provider_runs: List[ProviderRun] = []
         self.console = Console()
@@ -146,6 +182,15 @@ class ApiClient:
     @staticmethod
     def available_provider_names() -> List[str]:
         return ["local"]
+
+    @staticmethod
+    def _validate_local_base_url(base_url: str) -> str:
+        endpoint = (base_url or "").strip()
+        if not endpoint:
+            raise ValueError("Local LLM base URL is required")
+        if not is_local_endpoint_url(endpoint):
+            raise ValueError("Local LLM base URL must resolve to a local loopback endpoint")
+        return endpoint.rstrip("/")
 
     def call_api(
         self,
@@ -202,7 +247,10 @@ class SourceClient:
     ):
         self.internet_enabled = internet_enabled if internet_enabled is not None else os.getenv("INTERNET_ENABLED", "true").lower() == "true"
         self.allow_onion = allow_onion if allow_onion is not None else os.getenv("ALLOW_ONION", "true").lower() == "true"
-        self.tor_proxy = tor_proxy or os.getenv("TOR_PROXY", "socks5h://127.0.0.1:9050")
+        configured_tor_proxy = tor_proxy if tor_proxy is not None else os.getenv("TOR_PROXY", "socks5h://127.0.0.1:9050")
+        self.tor_proxy = (configured_tor_proxy or "").strip()
+        if self.allow_onion and not self.tor_proxy:
+            raise ValueError("TOR_PROXY must be non-empty when ALLOW_ONION is enabled")
         self.searxng_url = (searxng_url or os.getenv("SEARXNG_URL") or "").rstrip("/")
         self.user_agent = os.getenv("OSINT_USER_AGENT", "OSINT-Assistant/1.0 (+authorized research)")
 
@@ -233,32 +281,77 @@ class SourceClient:
         except ValueError:
             return False
 
+    @staticmethod
+    def _is_restricted_ip(ip: Union[ipaddress.IPv4Address, ipaddress.IPv6Address]) -> bool:
+        return (
+            ip.is_private
+            or ip.is_loopback
+            or ip.is_link_local
+            or ip.is_multicast
+            or ip.is_reserved
+            or ip.is_unspecified
+        )
+
+    @classmethod
+    def _resolve_host_ips(cls, hostname: str, port: int) -> set[str]:
+        try:
+            infos = socket.getaddrinfo(hostname, port, type=socket.SOCK_STREAM)
+        except OSError as exc:
+            raise ValueError(f"Denied fetch target: cannot resolve host ({hostname})") from exc
+        return {info[4][0] for info in infos}
+
     def _validate_fetch_target(self, url: str) -> None:
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"}:
             raise ValueError("Denied fetch target: only http(s) URLs are allowed")
-        if self._is_restricted_host(parsed.hostname):
+        hostname = parsed.hostname
+        if self._is_restricted_host(hostname):
             raise ValueError("Denied fetch target: restricted host")
+        if hostname and hostname.endswith(".onion"):
+            return
+        if not hostname:
+            raise ValueError("Denied fetch target: missing host")
+        port = parsed.port or (443 if parsed.scheme == "https" else 80)
+        for address in self._resolve_host_ips(hostname, port):
+            ip = ipaddress.ip_address(address)
+            if self._is_restricted_ip(ip):
+                raise ValueError("Denied fetch target: restricted host resolution")
 
     def fetch_url(self, url: str, timeout: int = 45) -> SourceFetch:
         if not self.internet_enabled:
             return SourceFetch(url=url, status="disabled", error="Internet access disabled", via_tor=route_for_url(url) == "tor")
         try:
-            self._validate_fetch_target(url)
-            proxies = self.proxies_for(url)
-            response = requests.get(url, headers={"User-Agent": self.user_agent}, proxies=proxies, timeout=timeout)
-            response.raise_for_status()
-            title, excerpt = self.extract_text(response.text)
-            return SourceFetch(
-                url=url,
-                status="ok",
-                http_status=response.status_code,
-                title=title,
-                text_excerpt=excerpt,
-                content_hash_sha256=hashlib.sha256(response.content).hexdigest(),
-                raw_content_base64=base64.b64encode(response.content).decode("ascii"),
-                via_tor=bool(proxies),
-            )
+            requested_url = url
+            current_url = url
+            redirects_followed = 0
+            while True:
+                self._validate_fetch_target(current_url)
+                proxies = self.proxies_for(current_url)
+                response = requests.get(
+                    current_url,
+                    headers={"User-Agent": self.user_agent},
+                    proxies=proxies,
+                    timeout=timeout,
+                    allow_redirects=False,
+                )
+                if 300 <= response.status_code < 400 and response.headers.get("Location"):
+                    if redirects_followed >= MAX_REDIRECTS:
+                        raise ValueError("Denied fetch target: too many redirects")
+                    redirects_followed += 1
+                    current_url = urljoin(current_url, response.headers["Location"])
+                    continue
+                response.raise_for_status()
+                title, excerpt = self.extract_text(response.text)
+                return SourceFetch(
+                    url=requested_url,
+                    status="ok",
+                    http_status=response.status_code,
+                    title=title,
+                    text_excerpt=excerpt,
+                    content_hash_sha256=hashlib.sha256(response.content).hexdigest(),
+                    raw_content_base64=base64.b64encode(response.content).decode("ascii"),
+                    via_tor=bool(proxies),
+                )
         except Exception as exc:  # noqa: BLE001
             return SourceFetch(url=url, status="error", error=str(exc), via_tor=route_for_url(url) == "tor")
 
@@ -486,7 +579,7 @@ is unknown, use https://example.invalid/source-needed and say source lookup is r
         self.console.print(f"[bold blue]Analyzing source:[/bold blue] {url}")
         evidence_ids = []
         source_text = ""
-        if is_url(url):
+        if is_url(url) and not is_placeholder_url(url):
             result = self.fetch_as_result(url)
             source_text = result.snippet
             if result.evidence_id:
@@ -620,7 +713,7 @@ Use UNKNOWN/N/A where the source does not support a claim.
         return [
             {
                 "title": f"Source lookup required for {query}",
-                "url": f"{{https://example.invalid/source-needed?q={encoded}}}&n={index + 1}",
+                "url": f"https://example.invalid/source-needed?q={encoded}&n={index + 1}",
                 "snippet": "Configure SEARXNG_URL for clearnet search, provide a direct URL, or provide a .onion URL with Tor running on TOR_PROXY.",
                 "source_type": "Source lookup required",
                 "timestamp": datetime.now().strftime("%Y-%m-%d"),

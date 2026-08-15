@@ -7,3 +7,4 @@ python-dotenv
 flask
 flask-cors
 PySocks
+fastmcp

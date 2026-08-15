@@ -135,7 +135,7 @@ The Flask API uses `.env` by default. `/api/search` accepts optional local field
 
 ## AIA behavior
 
-When `AIA_BASE_URL` is set, the assistant:
+By default, AIA is enabled and uses `AIA_BASE_URL=http://localhost:3001` unless you explicitly skip it (`skip_aia: true` in API payloads or `--skip-aia` in CLI). When enabled, the assistant:
 
 1. Calls `POST /verify` with a bounded statement summarizing the local OSINT run.
 2. Calls `POST /signals/ingest` with one signal per collected source.

@@ -1,6 +1,8 @@
 import base64
 import hashlib
 
+import pytest
+
 from osint_assistant import AIAClient, OSINTAssistant, ApiClient, SourceClient, SourceFetch, split_csv
 from siw_core import AppendOnlyStore, SIWRuntime
 
@@ -16,6 +18,11 @@ def test_provider_registry_is_local_only():
 def test_non_local_provider_requests_are_collapsed_to_local():
     client = ApiClient(providers=["perplexity", "openai"])
     assert client.providers == ["local"]
+
+
+def test_api_client_rejects_non_local_base_url_override():
+    with pytest.raises(ValueError, match="local loopback"):
+        ApiClient(base_url="https://api.openai.com/v1")
 
 
 def test_aia_defaults_to_localhost(monkeypatch):
@@ -36,6 +43,37 @@ def test_onion_uses_tor_proxy():
 def test_clearnet_uses_direct_connection():
     client = SourceClient()
     assert client.proxies_for("https://example.com") is None
+
+
+def test_source_client_rejects_hosts_that_resolve_to_private_ips(monkeypatch):
+    client = SourceClient()
+    monkeypatch.setattr(client, "_resolve_host_ips", lambda _host, _port: {"127.0.0.1"})
+    with pytest.raises(ValueError, match="restricted host resolution"):
+        client._validate_fetch_target("https://example.com")
+
+
+def test_source_client_redirect_validation_blocks_restricted_target(monkeypatch):
+    client = SourceClient()
+
+    class RedirectResponse:
+        status_code = 302
+        headers = {"Location": "http://127.0.0.1/internal"}
+        content = b""
+        text = ""
+
+        def raise_for_status(self):
+            return None
+
+    def resolve(host, _port):
+        if host == "example.com":
+            return {"93.184.216.34"}
+        return {"127.0.0.1"}
+
+    monkeypatch.setattr(client, "_resolve_host_ips", resolve)
+    monkeypatch.setattr("osint_assistant.requests.get", lambda *args, **kwargs: RedirectResponse())
+    result = client.fetch_url("https://example.com")
+    assert result.status == "error"
+    assert "restricted host" in (result.error or "")
 
 
 def test_raw_byte_hash_matches_evidence_artifact(tmp_path):
@@ -68,6 +106,22 @@ def test_raw_byte_hash_matches_evidence_artifact(tmp_path):
     assert result.evidence_id is not None
     evidence = runtime.store.load_all("evidence")[-1]
     assert evidence["content_hash_sha256"] == assistant.source_fetches[-1].content_hash_sha256
+
+
+def test_analyze_content_skips_placeholder_fetch(tmp_path, monkeypatch):
+    runtime = SIWRuntime(AppendOnlyStore(tmp_path), requested_by="tester")
+    case = runtime.create_case(
+        title="Placeholder",
+        authorized_purpose="Authorized research",
+        owner="tester",
+        policy_profile="clearnet_authorized",
+    )
+    assistant = OSINTAssistant(case_id=case.case_id, runtime=runtime, enable_aia=False)
+    monkeypatch.setattr(assistant, "fetch_as_result", lambda _url: (_ for _ in ()).throw(AssertionError("fetch should not run")))
+    monkeypatch.setattr(assistant.api_client, "call_api", lambda *args, **kwargs: "{}")
+    analysis = assistant.analyze_content("https://example.invalid/source-needed?q=test")
+    assert analysis is not None
+    assert assistant.source_fetches == []
 
 
 def test_aia_ingest_without_policy_allow_is_denied_and_logged(tmp_path, monkeypatch):
